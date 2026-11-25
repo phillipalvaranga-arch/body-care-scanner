@@ -84,12 +84,12 @@ html[data-theme="dark"] .cat[aria-pressed="true"]{color:#042329}
 .scan-msg{position:absolute;top:10px;left:0;right:0;text-align:center;color:#fff;font-size:.9rem;text-shadow:0 1px 4px #000}
 .scan-actions{position:absolute;bottom:10px;left:0;right:0;display:flex;gap:8px;justify-content:center}
 #qr-reader{width:100%}
-.search-res,.list{display:grid;gap:10px;margin-top:12px}
+.search-res,.list,.alt{display:grid;grid-template-columns:minmax(0,1fr);gap:10px;margin-top:12px}
 .item{display:flex;gap:12px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:10px;text-decoration:none;color:inherit;box-shadow:var(--shadow);transition:transform .15s}
 .item:active{transform:scale(.98)}
 .item img,.item .ph{width:56px;height:56px;border-radius:12px;object-fit:contain;background:#fff;flex:none;border:1px solid var(--line)}
 .item .ph{display:flex;align-items:center;justify-content:center;font-size:1.6rem;background:var(--bg2)}
-.item .meta{min-width:0;flex:1}
+.item .meta{min-width:0;flex:1}.item{min-width:0;max-width:100%}.item .row{flex-direction:column;align-items:flex-end;gap:4px}
 .item b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .item .sub{font-size:.84rem;color:var(--mut)}
 .badge{display:inline-flex;align-items:center;gap:4px;font-size:.74rem;font-weight:800;padding:3px 9px;border-radius:999px;letter-spacing:.02em;white-space:nowrap}
@@ -149,7 +149,7 @@ html[data-theme="dark"] .cat[aria-pressed="true"]{color:#042329}
 .filters button{border:1.5px solid var(--line);background:var(--card);color:var(--fg);border-radius:999px;padding:6px 12px;font:inherit;font-size:.86rem;cursor:pointer;min-height:38px}
 .filters button[aria-pressed="true"]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
 .src a{display:block;font-size:.84rem;margin:2px 0;word-break:break-word}
-.alt{display:grid;gap:10px}
+
 .toast{position:fixed;left:50%;bottom:calc(var(--tab-h) + var(--sb) + 18px);transform:translate(-50%,20px);background:#10252b;color:#fff;padding:10px 16px;border-radius:999px;opacity:0;pointer-events:none;transition:all .25s;z-index:60;max-width:90vw;font-size:.9rem}
 .toast.show{opacity:1;transform:translate(-50%,0)}
 .spin{width:22px;height:22px;border:3px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:rot .8s linear infinite;display:inline-block;vertical-align:middle;margin-right:8px}

@@ -5,7 +5,7 @@
   var OBF = "https://world.openbeautyfacts.org";
   var FIELDS = "code,product_name,product_name_en,brands,quantity,ingredients_text,ingredients_text_en,image_front_small_url,categories_tags,countries_tags";
   var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only" };
-  var VERSION = "bodycare-v1";
+  var VERSION = "bodycare-v2";
   var main = document.getElementById("main");
   var toastEl = document.getElementById("toast");
   var themeBtn = document.getElementById("themeBtn");
