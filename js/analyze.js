@@ -139,9 +139,9 @@
   /* word-run segmentation for lists missing commas: "Sodium Lauryl Sulfate Cellulose Gum" */
   function segment(piece, cat) {
     var words = norm(piece).split(" ");
-    if (words.length < 2 || words.length > 14) return null;
+    if (words.length < 2) return null;
     var out = [];
-    (function rec(i, acc) {
+    if (words.length <= 14) (function rec(i, acc) {
       if (out.length) return;
       if (i >= words.length) { out = acc.slice(); return; }
       for (var n = Math.min(MAXW, words.length - i); n >= 1; n--) {
@@ -149,7 +149,19 @@
         if (INDEX[chunk]) { acc.push(chunk); rec(i + n, acc); if (out.length) return; acc.pop(); }
       }
     })(0, []);
-    return out.length >= 2 ? out : null;
+    if (out.length >= 2) return out;
+    /* Long runs (a maker page that lost its commas): take the longest known names left to right and keep
+       unknown words together as one unrated piece. Used only when most of the words are recognised. */
+    if (words.length < 6 || words.length > 60) return null;
+    var res = [], unk = [], known = 0, i = 0;
+    while (i < words.length) {
+      var got = 0;
+      for (var n = Math.min(MAXW, words.length - i); n >= 1; n--) { if (INDEX[words.slice(i, i + n).join(" ")]) { got = n; break; } }
+      if (got) { if (unk.length) { res.push({ unk: unk.join(" ") }); unk = []; } res.push(words.slice(i, i + got).join(" ")); known += got; i += got; }
+      else { unk.push(words[i]); i++; }
+    }
+    if (unk.length) res.push({ unk: unk.join(" ") });
+    return known / words.length >= 0.5 && res.length >= 3 ? res : null;
   }
 
   /* ---------- parsing ---------- */
@@ -203,6 +215,7 @@
         var seg = segment(p, cat);
         if (seg) {
           seg.forEach(function (k) {
+            if (typeof k === "object") { items.push({ raw: k.unk, rated: false }); return; }
             var h = lookup(k, cat, false);
             items.push(make(p, h, true));
           });

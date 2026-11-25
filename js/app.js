@@ -2,15 +2,15 @@
 (function () {
   "use strict";
   var B = window.BCS;
-  var OBF = "https://world.openbeautyfacts.org";
+  var OBF = "https://world.openbeautyfacts.org", OBF_US = "https://us.openbeautyfacts.org";
   var SOURCES = [
     { id: "obf", host: "https://world.openbeautyfacts.org", name: "Open Beauty Facts" },
     { id: "opf", host: "https://world.openproductsfacts.org", name: "Open Products Facts" },
     { id: "off", host: "https://world.openfoodfacts.org", name: "Open Food Facts" }
   ];
   var FIELDS = "code,product_name,product_name_en,brands,quantity,ingredients_text,ingredients_text_en,image_front_small_url,categories_tags,countries_tags";
-  var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only" };
-  var VERSION = "bodycare-v3";
+  var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only", usOnly: "bcs-us-only" };
+  var VERSION = "bodycare-v4";
   var main = document.getElementById("main");
   var toastEl = document.getElementById("toast");
   var themeBtn = document.getElementById("themeBtn");
@@ -123,6 +123,8 @@
     var list = candidates(raw);
     if (!list.length) throw new Error("Enter a barcode number.");
     lookupIssues = [];
+    var fromLib = await libLookup(raw);
+    if (fromLib) return fromLib;
     var all = [];
     async function stage(srcs) {
       var res = await Promise.all([].concat.apply([], srcs.map(function (src) { return list.map(function (c) { return askSource(src, c, true); }); })));
@@ -138,11 +140,65 @@
     if (all.length && all.every(function (r) { return r.err; })) throw all[0].err;
     return null;
   }
-  async function searchName(q, cat) {
-    var u = OBF + "/cgi/search.pl?search_terms=" + encodeURIComponent(q) + "&search_simple=1&action=process&json=1&page_size=24&fields=" + FIELDS;
+  function usOnly() { return load(KEYS.usOnly, true) !== false; }
+  function usToggle(id) { return '<label class="switch"><input type="checkbox" id="' + id + '" ' + (usOnly() ? "checked" : "") + '> 🇺🇸 US products only <span class="muted small">(hides products sold only in Europe and elsewhere)</span></label>'; }
+  function wireUs(id, fn) { var el = $("#" + id); if (el) el.addEventListener("change", function () { save(KEYS.usOnly, el.checked); fn(); }); }
+  async function searchOBF(q, cat) {
+    var us = usOnly();
+    var u = (us ? OBF_US : OBF) + "/cgi/search.pl?search_terms=" + encodeURIComponent(q) + "&search_simple=1&action=process&json=1&page_size=24&fields=" + FIELDS;
     if (cat) u += "&tagtype_0=categories&tag_contains_0=contains&tag_0=" + encodeURIComponent(B.CAT_BY_ID[cat].tag.replace("en:", ""));
     var d = await getJSON(u, 25000);
-    return ((d && d.products) || []).filter(function (p) { return p.code; }).map(function (p) { return norm(p); });
+    var res = ((d && d.products) || []).filter(function (p) { return p.code; }).map(function (p) { return norm(p); });
+    return us ? res.filter(function (p) { return p.us; }) : res;
+  }
+  /* Built-in US library first, then Open Beauty Facts. */
+  async function searchName(q, cat) {
+    var lib = await libSearch(q, cat).catch(function () { return []; }), obf = [], err = null;
+    try { obf = await searchOBF(q, cat); } catch (e) { err = e; }
+    if (err && !lib.length) throw err;
+    var seen = {}; lib.forEach(function (p) { seen[p.code] = 1; });
+    return lib.concat(obf.filter(function (p) { var k = p.code.length === 13 && p.code[0] === "0" ? p.code.slice(1) : p.code; return !seen[k] && !seen[p.code]; }));
+  }
+  /* ---------- built-in US product library (data/us-products.json) ---------- */
+  var LIB = null, LIBP = null;
+  function loadLib() {
+    if (LIB) return Promise.resolve(LIB);
+    if (!LIBP) LIBP = fetch("data/us-products.json").then(function (r) { if (!r.ok) throw new Error("US library " + r.status); return r.json(); }).then(function (d) {
+      var by = {}; d.rows.forEach(function (r) { by[r[0]] = r; });
+      LIB = { d: d, by: by, tok: null }; return LIB;
+    }).catch(function (e) { LIBP = null; throw e; });
+    return LIBP;
+  }
+  function libProduct(r, d) {
+    return { code: r[0], name: r[1], brands: r[2], qty: "", img: "", ing: d.ing[r[4]], cat: r[3], tags: [], us: true, srcName: d.sources[r[7]], srcUrl: r[6], lib: { active: r[5], updated: r[8], checked: d.checked } };
+  }
+  async function libLookup(raw) {
+    var L; try { L = await loadLib(); } catch (e) { return null; }
+    var list = candidates(raw);
+    for (var i = 0; i < list.length; i++) { var c = list[i], k = c.length === 13 && c[0] === "0" ? c.slice(1) : c; if (L.by[k]) return libProduct(L.by[k], L.d); }
+    return null;
+  }
+  async function libSearch(q, cat) {
+    var L = await loadLib(), qt = tokens(q);
+    if (!qt.length) return [];
+    if (!L.tok) L.tok = L.d.rows.map(function (r) { return tokens(r[2] + " " + r[1]); });
+    var out = [];
+    L.d.rows.forEach(function (r, i) {
+      if (cat && r[3] !== cat) return;
+      var rt = L.tok[i], hit = qt.filter(function (x) { return rt.indexOf(x) >= 0 || rt.some(function (y) { return y.length > 4 && x.length > 4 && y.indexOf(x) === 0; }); }).length;
+      if (hit === qt.length || (qt.length >= 3 && hit >= qt.length - 1)) out.push({ r: r, s: hit / qt.length });
+    });
+    out.sort(function (a, b) { return (b.s - a.s) || (a.r[1].length - b.r[1].length); });
+    return out.slice(0, 30).map(function (o) { return libProduct(o.r, L.d); });
+  }
+  async function libByCat(cat) {
+    var L = await loadLib();
+    return L.d.rows.filter(function (r) { return r[3] === cat; }).map(function (r) { return libProduct(r, L.d); });
+  }
+  function dkey(p) { return ((p.brands || "") + " " + p.name).toLowerCase().replace(/,?\s*\(?[\d.]+\s*(fl\.?\s*oz|oz|ml|l|g|ct|count|pack|pk|ounce|fl)\b.*$/, "").replace(/\W+/g, " ").trim() + "|" + (p.ing || "").length; }
+  function fmtDate(iso) {
+    var m = /^(\d{4})-(\d\d)-(\d\d)/.exec(iso || ""); if (!m) return iso || "";
+    return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][+m[2] - 1] + " " + (+m[3]) + ", " + m[1];
   }
   var STOPW = { the: 1, and: 1, for: 1, with: 1, of: 1, oz: 1, ml: 1, fl: 1, ct: 1, pack: 1, count: 1, size: 1, new: 1 };
   function tokens(s) {
@@ -316,7 +372,7 @@
   }
   function listRow(p, an, href) {
     return '<a class="item" href="' + href + '">' + (p.img ? '<img loading="lazy" src="' + esc(p.img) + '" alt="">' : '<div class="ph" aria-hidden="true">🧴</div>') +
-      '<div class="meta"><b>' + esc(p.name) + '</b><div class="sub">' + esc(p.brands || "Unknown brand") + (p.score != null ? " · Score " + p.score : "") + "</div></div>" +
+      '<div class="meta"><b>' + esc(p.name) + '</b><div class="sub">' + esc(p.brands || "Unknown brand") + (p.score != null ? " · Score " + p.score : "") + (p.lib ? " · 🇺🇸 maker label" : "") + "</div></div>" +
       '<div class="row" style="justify-content:flex-end;flex:none;max-width:110px">' + vbadge(an ? an.verdict : p.verdict) + ((an ? an.endoDirect.length : p.endo) ? '<span class="badge hor" title="Hormone-disruptor flag">⚠ Hormone</span>' : "") + "</div></a>";
   }
 
@@ -335,7 +391,7 @@
       '<div class="or">or search by name</div>' +
       '<form class="card" id="nameForm"><div class="field"><label for="nameIn">Product name or brand</label><input id="nameIn" autocomplete="off" placeholder="For example Colgate, Listerine, Dove"></div>' +
       '<div class="small muted">Optional: pick a type to narrow the search, or to see the best-rated products of that type.</div>' + catChips(selCat, "chips") +
-      '<button type="submit" class="btn block ghost">Search Open Beauty Facts</button><div id="browseLink"></div><div id="searchOut" class="search-res"></div></form>' +
+      ''+ usToggle("usOnlyHome") + '<button type="submit" class="btn block ghost">Search</button><div id="browseLink"></div><div id="searchOut" class="search-res"></div></form>' +
       '<div class="or">or use the ingredient list</div><a class="btn ghost block" href="#/check">📝 Paste or photograph the ingredient list</a>' +
       recentStrip() + disclaimer();
     $("#startScan").addEventListener("click", beginScan);
@@ -343,6 +399,7 @@
     $("#codeForm").addEventListener("submit", function (e) { e.preventDefault(); var d = digits($("#codeIn").value); if (d.length < 6) return toast("Enter at least 6 digits."); location.hash = "#/product/" + d; });
     $("#nameForm").addEventListener("submit", function (e) { e.preventDefault(); runSearch($("#nameIn").value.trim()); });
     wireChips("chips", function (v) { selCat = v; browseLink(); });
+    wireUs("usOnlyHome", function () { var q = $("#nameIn").value.trim(); if (q.length >= 2) runSearch(q); });
     browseLink();
   }
   function browseLink() {
@@ -363,7 +420,7 @@
       if (!res.length) { out.innerHTML = '<div class="note">Nothing found for \u201C' + esc(q) + '\u201D' + (selCat ? " in that type" : "") + ". Try the brand alone, a shorter name, or <a href=\"#/check\">paste the ingredient list</a>.</div>"; return; }
       out.innerHTML = res.map(function (p) {
         var an = p.ing ? B.analyze(p.ing, p.cat) : null;
-        var q2 = { code: p.code, name: p.name, brands: p.brands, img: p.img, score: an && an.enough ? an.score : null };
+        var q2 = { code: p.code, name: p.name, brands: p.brands, img: p.img, lib: !!p.lib, score: an && an.enough ? an.score : null };
         return listRow(q2, an || { verdict: null, endoDirect: [] }, "#/product/" + encodeURIComponent(p.code));
       }).join("");
     } catch (e) { out.innerHTML = '<div class="note">Search is not available right now (' + esc(e.message) + "). Check your connection or type the barcode.</div>"; }
@@ -447,7 +504,7 @@
   var MATCH_NOTE = '<p class="small muted" style="margin:0 0 8px">These are <b>different database entries with similar names, not your exact barcode</b>. Formulas can differ by country, size and version, so compare the ingredient list on your package before trusting a rating.</p>';
   function matchRows(list) {
     return list.map(function (m) {
-      var an = B.analyze(m.ing, m.cat), q = { code: m.code, name: m.name, brands: m.brands, img: m.img, score: an.enough ? an.score : null };
+      var an = B.analyze(m.ing, m.cat), q = { code: m.code, name: m.name, brands: m.brands, img: m.img, lib: !!m.lib, score: an.enough ? an.score : null };
       return listRow(q, an, "#/product/" + encodeURIComponent(m.code));
     }).join("");
   }
@@ -461,14 +518,15 @@
     } catch (e) { if (tok === routeToken) box.innerHTML = '<div class="info">The name search is not available right now (' + esc(e.message) + ").</div>"; }
   }
   function notFound(code) {
-    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
+    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in the built-in US library (" + (LIB ? LIB.d.rows.length.toLocaleString() : "2,000+") + " products), Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
       "<p><b>Three ways to still get a rating:</b></p></div>" +
-      '<div class="card"><h3>1. Search by name</h3><form id="nfForm"><div class="field"><label for="nfName">What is the product called? (brand and name)</label><input id="nfName" autocomplete="off" placeholder="For example Crest Cavity Protection"></div><button type="submit" class="btn block">Find by name</button></form><div id="nfOut" class="search-res" style="margin-top:10px"></div>' +
+      '<div class="card"><h3>1. Search by name</h3><form id="nfForm"><div class="field"><label for="nfName">What is the product called? (brand and name)</label><input id="nfName" autocomplete="off" placeholder="For example Crest Cavity Protection"></div>'+ usToggle("usOnlyNf") + '<button type="submit" class="btn block">Find by name</button></form><div id="nfOut" class="search-res" style="margin-top:10px"></div>' +
       '<div class="row" style="margin-top:8px" id="nfWeb">' + webLinks(code + " barcode") + "</div></div>" +
       '<div class="card"><h3>2. Read the package</h3><p class="small muted">Photograph or paste the ingredient list from the back of the package, or find the ingredients on the brand’s website with the search links above.</p></div>' +
       pasteForm("nf", code, "") + '<div id="pasteOut"></div>' +
       '<div class="card"><h3>3. Help everyone</h3><p class="small">Add the product to the free database: <a href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(code) + '" target="_blank" rel="noopener">Open Beauty Facts</a>.</p></div>' + disclaimer();
     wirePaste("nf", { code: code, name: "Barcode " + code, brands: "", img: "", cat: "" });
+    wireUs("usOnlyNf", function () { if ($("#nfName").value.trim().length >= 2) $("#nfForm").requestSubmit(); });
     var rl = $("#retryLook"); if (rl) rl.addEventListener("click", function (e) { e.preventDefault(); renderProduct(code); });
     $("#nfForm").addEventListener("submit", async function (e) {
       e.preventDefault(); var q = $("#nfName").value.trim(), out = $("#nfOut"), tok = routeToken;
@@ -482,18 +540,28 @@
       } catch (er) { out.innerHTML = '<div class="note">Search is not available right now (' + esc(er.message) + ").</div>"; }
     });
   }
+  async function libImage(p) {
+    var tok = routeToken;
+    try {
+      var d = await getJSON(OBF + "/api/v2/product/0" + encodeURIComponent(p.code) + ".json?fields=image_front_small_url", 8000);
+      var img = d && d.product && d.product.image_front_small_url;
+      if (!img || tok !== routeToken) return;
+      var ph = $(".prodhead .ph"); if (ph) { var im = document.createElement("img"); im.src = img; im.alt = ""; ph.replaceWith(im); }
+    } catch (e) {}
+  }
   function showProduct(p) {
     var override = overrides()[p.code];
     var an = analyzeProduct(p);
     remember(p, an);
     var cat = p.cat ? B.CAT_BY_ID[p.cat] : null;
     var fav = isFav(p.code);
+    var srcLine = p.lib ? '<div class="srcline">Ingredients from <a href="' + esc(p.srcUrl) + '" target="_blank" rel="noopener">' + esc(p.srcName) + "</a>, checked " + esc(fmtDate(p.lib.checked)) + (p.lib.updated ? " (source updated " + esc(fmtDate(p.lib.updated)) + ")" : "") + "." + (p.lib.active ? "<br>Active ingredient (drug facts): " + esc(p.lib.active.replace(/^\s*active ingredients?\s*(\([^)]*\))?\s*[:\-]?\s*/i, "").replace(/\s*purposes?\b.*$/i, "")) : "") + "</div>" : "";
     var head = '<div class="card"><div class="prodhead">' + (p.img ? '<img src="' + esc(p.img) + '" alt="">' : '<div class="ph" style="width:84px;height:84px;display:flex;align-items:center;justify-content:center;font-size:2.4rem" aria-hidden="true">🧴</div>') +
       '<div><h1>' + esc(p.name) + '</h1><div class="muted">' + esc(p.brands || "Unknown brand") + (p.qty ? " · " + esc(p.qty) : "") + '</div><div class="row" style="margin-top:6px">' +
-      (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
+      (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.lib ? '<span class="chip low">🇺🇸 US maker label</span>' : "") + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
       '<div class="row" style="margin-top:10px"><button class="btn small ' + (fav ? "" : "ghost") + '" id="favBtn">' + (fav ? "★ Saved" : "☆ Save to favorites") + '</button>' +
-      (p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="' + esc(p.srcUrl || ("https://world.openbeautyfacts.org/product/" + encodeURIComponent(p.code))) + '">' + esc(p.srcName || "Open Beauty Facts") + " page</a>") +
-      '<button class="btn small ghost" id="editBtn">✏️ Edit ingredient list</button></div></div>';
+      (p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="' + esc(p.srcUrl || ("https://world.openbeautyfacts.org/product/" + encodeURIComponent(p.code))) + '">' + (p.lib ? "Maker label source" : esc(p.srcName || "Open Beauty Facts") + " page") + "</a>") +
+      '<button class="btn small ghost" id="editBtn">✏️ Edit ingredient list</button></div>' + srcLine + '</div>';
     var body;
     if (!an.total) {
       body = '<div class="verdict NA"><div class="big">?<small>NO INGREDIENTS LISTED</small></div><p>' + esc(p.srcName || "Open Beauty Facts") + ' knows this barcode' + (p.name === "Unnamed product" ? " (only a photo, no name)" : " and its name") + ', but nobody has entered the ingredient list yet, so it cannot be rated. The app does not guess. Check the similar products below, read the list off the package and paste it, or photograph it.</p></div>' +
@@ -522,6 +590,7 @@
       $$("#ingList .ing").forEach(function (r) { r.hidden = !(f === "all" || (f === "h" ? r.getAttribute("data-h") === "1" : r.getAttribute("data-lv") === f)); });
     });
     animateBars();
+    if (p.lib && !p.img) libImage(p);
     if (!an.total && !p.pasted && $("#nameBox")) showNameMatches($("#nameBox"), p.name, p.brands, p.code);
     if (an.enough && p.cat && !p.pasted) loadAlternatives(p, an);
   }
@@ -529,12 +598,13 @@
     var box = $("#altBox"); if (!box) return; var tok = routeToken;
     box.innerHTML = '<h2>Cleaner picks in the same category</h2><div class="muted"><span class="spin"></span>Looking for better-rated products in Open Beauty Facts…</div>';
     try {
-      var list = await browseCat(p.cat, true);
-      if (list.length < 8) list = list.concat(await browseCat(p.cat, false));
+      var lib = await libByCat(p.cat).catch(function () { return []; }), list = [];
+      try { list = await browseCat(p.cat, true); if (!usOnly() && list.length < 8) list = list.concat(await browseCat(p.cat, false)); } catch (e) { if (!lib.length) throw e; }
+      list = lib.concat(list);
       if (tok !== routeToken) return;
       var seen = {}, scored = [];
       list.forEach(function (q) {
-        if (q.code === p.code || seen[q.code] || !q.ing) return; seen[q.code] = 1;
+        var dk = dkey(q); if (q.code === p.code || seen[q.code] || seen[dk] || !q.ing || dk === dkey(p)) return; seen[q.code] = 1; seen[dk] = 1;
         var a = B.analyze(q.ing, q.cat || p.cat);
         if (!a.enough || a.total < 5) return;
         scored.push({ p: q, a: a });
@@ -547,7 +617,7 @@
       var html = "<h2>Cleaner picks in the same category</h2>";
       if (!better.length) html += '<div class="info">No clearly better-rated product turned up among the most-scanned ' + esc(B.CAT_BY_ID[p.cat].label.toLowerCase()) + " products in Open Beauty Facts. <a href=\"#/browse/" + p.cat + '">Browse the best-rated ones</a>.</div>';
       else html += '<p class="muted small" style="margin-top:-6px">Real products from Open Beauty Facts in the same category with a higher score from this app and no extra hormone flags' + (p.cat === "toothpaste" && curF ? " (and still containing fluoride, which the ADA and CDC recommend for cavity protection)" : "") + '. Ratings are computed from each listed ingredient list; check the package.</p><div class="alt">' +
-        better.map(function (s) { var q = { code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, score: s.a.score }; return listRow(q, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div>";
+        better.map(function (s) { var q = { code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, score: s.a.score }; return listRow(q, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div>";
       box.innerHTML = html;
     } catch (e) { if (tok === routeToken) box.innerHTML = ""; }
   }
@@ -622,20 +692,23 @@
   async function renderBrowse(cat) {
     var tok = routeToken, c = B.CAT_BY_ID[cat]; if (!c) { location.hash = "#/scan"; return; }
     var only = !!load(KEYS.hormOnly, false);
-    main.innerHTML = "<h1>" + c.icon + " Best-rated " + esc(c.label.toLowerCase()) + "</h1><p class=\"lead\">Real products from Open Beauty Facts (most-scanned, US first), re-rated by this app from their listed ingredients. Only products with an ingredient list are shown.</p>" +
-      '<label class="switch"><input type="checkbox" id="bh" ' + (only ? "checked" : "") + '> Hide products with hormone-disruptor flags</label>' + (cat === "toothpaste" ? '<label class="switch"><input type="checkbox" id="bf" checked> Only toothpastes with fluoride (the ADA and CDC recommend fluoride for cavity protection; this rating does not reward it)</label>' : "") + '<div id="bout"><span class="spin"></span>Loading…</div>' + disclaimer();
+    main.innerHTML = "<h1>" + c.icon + " Best-rated " + esc(c.label.toLowerCase()) + "</h1><p class=\"lead\">Real products from the built-in US library (ingredient lists from the makers’ own labels) and Open Beauty Facts, re-rated by this app from their listed ingredients. Only products with an ingredient list are shown.</p>" +
+      '<label class="switch"><input type="checkbox" id="bh" ' + (only ? "checked" : "") + '> Hide products with hormone-disruptor flags</label>' + usToggle("busOnly") + (cat === "toothpaste" ? '<label class="switch"><input type="checkbox" id="bf" checked> Only toothpastes with fluoride (the ADA and CDC recommend fluoride for cavity protection; this rating does not reward it)</label>' : "") + '<div id="bout"><span class="spin"></span>Loading…</div>' + disclaimer();
     try {
-      var list = await browseCat(cat, true); if (list.length < 15) list = list.concat(await browseCat(cat, false));
+      var lib = await libByCat(cat).catch(function () { return []; }), list = [];
+      try { list = await browseCat(cat, true); if (!usOnly() && list.length < 15) list = list.concat(await browseCat(cat, false)); } catch (e) { if (!lib.length) throw e; }
+      list = lib.concat(list);
       if (tok !== routeToken) return;
       var seen = {}, rows = [];
-      list.forEach(function (q) { if (seen[q.code] || !q.ing) return; seen[q.code] = 1; var a = B.analyze(q.ing, cat); if (a.enough && a.total >= 5) rows.push({ p: q, a: a }); });
+      list.forEach(function (q) { var dk = dkey(q); if (seen[q.code] || seen[dk] || !q.ing) return; seen[q.code] = 1; seen[dk] = 1; var a = B.analyze(q.ing, cat); if (a.enough && a.total >= 5) rows.push({ p: q, a: a }); });
       rows.sort(function (x, y) { return y.a.score - x.a.score; });
       function draw() {
         var hide = $("#bh").checked; save(KEYS.hormOnly, hide);
         var r = hide ? rows.filter(function (x) { return !x.a.endoDirect.length; }) : rows;
         if ($("#bf") && $("#bf").checked) r = r.filter(function (x) { return x.a.items.some(function (i) { return i.rated && i.entry.id === "fluoride"; }); });
-        $("#bout").innerHTML = r.length ? '<div class="list">' + r.slice(0, 30).map(function (s) { return listRow({ code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, score: s.a.score }, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div><p class=\"fine\">" + rows.length + " products with readable ingredient lists were rated. Open Beauty Facts does not have every product.</p>" : '<div class="card">No products to show with that filter.</div>';
+        $("#bout").innerHTML = r.length ? '<div class="list">' + r.slice(0, 30).map(function (s) { return listRow({ code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, score: s.a.score }, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div><p class=\"fine\">" + rows.length + " products with readable ingredient lists were rated. Open Beauty Facts does not have every product.</p>" : '<div class="card">No products to show with that filter.</div>';
       }
+      wireUs("busOnly", function () { renderBrowse(cat); });
       $("#bh").addEventListener("change", draw); if ($("#bf")) $("#bf").addEventListener("change", draw); draw();
     } catch (e) { if (tok === routeToken) $("#bout").innerHTML = '<div class="note">Could not load products (' + esc(e.message) + "). Check your connection.</div>"; }
   }

@@ -1,7 +1,7 @@
-const C = 'bodycare-v3';
+const C = 'bodycare-v4';
 const F = [
   './', 'index.html', 'style.css', 'js/app.js', 'js/analyze.js', 'js/db.js',
-  'vendor/html5-qrcode.min.js', 'manifest.webmanifest',
+  'vendor/html5-qrcode.min.js', 'data/us-products.json', 'manifest.webmanifest',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/maskable-512.png', 'icons/apple-touch-icon.png', 'icons/favicon.png', 'icon.ico'
 ];
 self.addEventListener('install', (e) => {

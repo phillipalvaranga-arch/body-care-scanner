@@ -19,3 +19,14 @@ Informational only; not medical advice. Ratings summarize what regulators and sc
 - Lookup: Open Beauty Facts, then Open Products Facts and Open Food Facts, trying UPC-A (12 digits), EAN-13 (leading 0) and UPC-E expansions.
 - If the barcode is known but has no ingredients, or is unknown: search by name in Open Beauty Facts (clearly labelled "similar product, not your barcode"), paste or photograph the ingredient list, or open a DuckDuckGo/Google search for "<name> ingredients". The app never invents ingredients.
 - UPCitemdb and similar UPC-to-name services are not used: they block browser requests (CORS) or need an API key.
+
+## Built-in US product library (v4)
+
+`data/us-products.json` holds 2,278 US drugstore products (UPC + full ingredient list), checked Nov 25, 2026:
+
+- **Maker SmartLabel pages** (1,959 products): Procter & Gamble (smartlabel.pg.com: Crest, Scope, Pantene, Head & Shoulders, Herbal Essences, Aussie, Old Spice, Secret, Gillette, Olay, Ivory, Safeguard) and Colgate-Palmolive (colgatepalmolive.com/en-us/smartlabel: Colgate, Irish Spring, Softsoap, Speed Stick, Tom's of Maine). Each page is keyed by the product's UPC and lists its ingredients.
+- **FDA drug labels** (the rest): over-the-counter products such as Listerine, fluoride toothpastes and rinses, antiperspirants, dandruff shampoos and antibacterial soaps, from openFDA / DailyMed. The UPC and the active and inactive ingredients come from the label the maker submitted to the FDA.
+
+Each row keeps its source URL and the date the source says it was last updated. Scanned barcodes are checked against this library first (12- and 13-digit forms), then Open Beauty Facts, Open Products Facts and Open Food Facts. Name search and the best-rated lists include it. Build scripts are in `tools/us-library/`. Nothing is invented: a product is included only when its source gives both the UPC and the ingredient list.
+
+The "US products only" switch (on by default) limits Open Beauty Facts searches, best-rated lists and suggestions to products sold in the US (using us.openbeautyfacts.org and the countries field).
