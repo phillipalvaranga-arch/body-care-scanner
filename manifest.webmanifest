@@ -1,0 +1,16 @@
+{
+  "name": "Body Care Scanner",
+  "short_name": "Body Care",
+  "description": "Scan toothpaste, mouthwash, shampoo, soap, body wash, deodorant or lotion. Every ingredient in plain English, rated Good for you, OK or Bad for you, with hormone-disruptor flags. Informational only.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#075a6a",
+  "theme_color": "#0e8a9c",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+    {"src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Body Care Scanner</title>
+  <meta name="description" content="Scan toothpaste, mouthwash, shampoo, soap, body wash, deodorant or lotion. See every ingredient in plain English, rated Good for you, OK or Bad for you, with hormone-disruptor flags and sources. Informational only.">
+  <meta name="theme-color" content="#0e8a9c">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Body Care Scanner">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/favicon.png" type="image/png">
+  <link rel="icon" href="icon.ico" sizes="any">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script>try{var t=localStorage.getItem('bcs-theme');if(t)document.documentElement.dataset.theme=t;else if(matchMedia('(prefers-color-scheme: dark)').matches)document.documentElement.dataset.theme='dark';}catch(e){}</script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <a class="brand" href="#/scan" aria-label="Body Care Scanner home">
+      <img src="icons/icon-192.png" alt="" width="42" height="42">
+      <span><b>Body Care Scanner</b><small>What is really in it?</small></span>
+    </a>
+    <div class="top-actions">
+      <span id="netPill" class="pill" role="status">Checking…</span>
+      <button type="button" id="themeBtn" class="icon-btn" aria-pressed="false">Dark mode</button>
+    </div>
+  </header>
+  <main id="main" tabindex="-1"></main>
+  <nav class="tabs" aria-label="Main sections">
+    <button type="button" data-go="scan"><span aria-hidden="true">📷</span>Scan</button>
+    <button type="button" data-go="check"><span aria-hidden="true">📝</span>Check list</button>
+    <button type="button" data-go="history"><span aria-hidden="true">🕑</span>History</button>
+    <button type="button" data-go="favorites"><span aria-hidden="true">★</span>Favorites</button>
+    <button type="button" data-go="hormones"><span aria-hidden="true">⚠️</span>Hormones</button>
+    <button type="button" data-go="learn"><span aria-hidden="true">ⓘ</span>Learn</button>
+  </nav>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="vendor/html5-qrcode.min.js" defer></script>
+  <script src="js/db.js" defer></script>
+  <script src="js/analyze.js" defer></script>
+  <script src="js/app.js" defer></script>
+</body>
+</html>
