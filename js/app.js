@@ -3,14 +3,19 @@
   "use strict";
   var B = window.BCS;
   var OBF = "https://world.openbeautyfacts.org";
+  var SOURCES = [
+    { id: "obf", host: "https://world.openbeautyfacts.org", name: "Open Beauty Facts" },
+    { id: "opf", host: "https://world.openproductsfacts.org", name: "Open Products Facts" },
+    { id: "off", host: "https://world.openfoodfacts.org", name: "Open Food Facts" }
+  ];
   var FIELDS = "code,product_name,product_name_en,brands,quantity,ingredients_text,ingredients_text_en,image_front_small_url,categories_tags,countries_tags";
   var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only" };
-  var VERSION = "bodycare-v2";
+  var VERSION = "bodycare-v3";
   var main = document.getElementById("main");
   var toastEl = document.getElementById("toast");
   var themeBtn = document.getElementById("themeBtn");
   var netPill = document.getElementById("netPill");
-  var scanCtl = null, searchTimer = 0, selCat = "", routeToken = 0;
+  var scanSession = 0, scanCtl = null, searchTimer = 0, selCat = "", routeToken = 0;
 
   function $(s, r) { return (r || document).querySelector(s); }
   function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
@@ -56,74 +61,152 @@
 
   /* ---------- Open Beauty Facts ---------- */
   function digits(s) { return String(s || "").replace(/\D/g, ""); }
+  function upceToUpca(d) {
+    if (d.length !== 8 || (d[0] !== "0" && d[0] !== "1")) return "";
+    var n = d[0], m = d.slice(1, 7), c = d[7], x = m[5], body;
+    if (x === "0" || x === "1" || x === "2") body = m.slice(0, 2) + x + "0000" + m.slice(2, 5);
+    else if (x === "3") body = m.slice(0, 3) + "00000" + m.slice(3, 5);
+    else if (x === "4") body = m.slice(0, 4) + "00000" + m[4];
+    else body = m.slice(0, 5) + "0000" + x;
+    return n + body + c;
+  }
+  function checkOK(d) {
+    if (!/^\d+$/.test(d) || (d.length !== 8 && d.length !== 12 && d.length !== 13 && d.length !== 14)) return false;
+    function gs1(x) { var sum = 0, k = 0; for (var i = x.length - 2; i >= 0; i--, k++) sum += +x[i] * (k % 2 === 0 ? 3 : 1); return (10 - (sum % 10)) % 10 === +x[x.length - 1]; }
+    if (gs1(d)) return true;
+    if (d.length === 8) { var u = upceToUpca(d); if (u && gs1(u)) return true; }
+    return false;
+  }
   function candidates(raw) {
     var d = digits(raw), out = [];
     function add(x) { if (x && out.indexOf(x) < 0) out.push(x); }
     add(d);
+    var up = upceToUpca(d);
+    if (up) { add(up); add("0" + up); }
     if (d.length === 12) add("0" + d);
     if (d.length === 13 && d.charAt(0) === "0") add(d.slice(1));
+    if (d.length === 14 && d.charAt(0) === "0") { add(d.slice(1)); add(d.slice(2)); }
     if (d.length >= 8 && d.length < 13) add(d.padStart(13, "0"));
     return out;
   }
-  function norm(p) {
+  function norm(p, src) {
     var ing = p.ingredients_text_en || p.ingredients_text || "";
     var name = p.product_name_en || p.product_name || "";
     var tags = p.categories_tags || [];
     var cat = B.guessCategory(name + " " + (p.brands || ""), tags);
-    return { code: String(p.code), name: name || "Unnamed product", brands: p.brands || "", qty: p.quantity || "", img: p.image_front_small_url || "", ing: ing, cat: cat, tags: tags };
+    src = src || SOURCES[0];
+    return { code: String(p.code), name: name || "Unnamed product", brands: p.brands || "", qty: p.quantity || "", img: p.image_front_small_url || "", ing: ing, cat: cat, tags: tags, us: (p.countries_tags || []).indexOf("en:united-states") >= 0, srcName: src.name, srcUrl: src.host + "/product/" + encodeURIComponent(p.code) };
   }
-  async function getJSON(url) {
-    var res = await fetch(url, { headers: { Accept: "application/json" } });
-    if (res.status === 404) return null;
-    if (!res.ok) throw new Error("Open Beauty Facts returned " + res.status);
-    return res.json();
+  async function getJSON(url, ms) {
+    var ctl = typeof AbortController === "function" ? new AbortController() : null, t = ctl && setTimeout(function () { ctl.abort(); }, ms || 20000);
+    try {
+      var res = await fetch(url, { headers: { Accept: "application/json" }, signal: ctl ? ctl.signal : undefined });
+      if (res.status === 404) return null;
+      if (!res.ok) throw new Error("The database returned " + res.status);
+      return await res.json();
+    } catch (e) { if (e && e.name === "AbortError") throw new Error("The database took too long to answer"); throw e; }
+    finally { if (t) clearTimeout(t); }
+  }
+  /* Look the barcode up in three free sister databases (same API), trying UPC-A and EAN-13 forms.
+     Open Beauty Facts first; the other two only when it has no ingredient list. A failed request is retried once. */
+  var lookupIssues = [];
+  function askSource(src, c, retry) {
+    return getJSON(src.host + "/api/v2/product/" + encodeURIComponent(c) + ".json?fields=" + FIELDS, 14000).then(function (d) {
+      if (d && d.status === 1 && d.product) { d.product.code = d.product.code || d.code || c; return { src: src, p: norm(d.product, src) }; }
+      return { src: src, p: null };
+    }, function (e) {
+      if (retry) return new Promise(function (r) { setTimeout(r, 900); }).then(function () { return askSource(src, c, false); });
+      return { src: src, err: e };
+    });
   }
   async function lookup(raw) {
     var list = candidates(raw);
     if (!list.length) throw new Error("Enter a barcode number.");
-    for (var i = 0; i < list.length; i++) {
-      var d = await getJSON(OBF + "/api/v2/product/" + encodeURIComponent(list[i]) + ".json?fields=" + FIELDS);
-      if (d && d.status === 1 && d.product) { d.product.code = d.product.code || d.code || list[i]; return norm(d.product); }
+    lookupIssues = [];
+    var all = [];
+    async function stage(srcs) {
+      var res = await Promise.all([].concat.apply([], srcs.map(function (src) { return list.map(function (c) { return askSource(src, c, true); }); })));
+      res.forEach(function (r) { if (r.err && lookupIssues.indexOf(r.src.name) < 0) lookupIssues.push(r.src.name); });
+      all = all.concat(res);
+      return res.filter(function (r) { return r.p && r.p.ing; });
     }
+    var hit = await stage([SOURCES[0]]);
+    if (!hit.length) hit = await stage([SOURCES[1], SOURCES[2]]);
+    if (hit.length) return hit[0].p;
+    var found = all.filter(function (r) { return r.p; });
+    if (found.length) return found[0].p;
+    if (all.length && all.every(function (r) { return r.err; })) throw all[0].err;
     return null;
   }
   async function searchName(q, cat) {
     var u = OBF + "/cgi/search.pl?search_terms=" + encodeURIComponent(q) + "&search_simple=1&action=process&json=1&page_size=24&fields=" + FIELDS;
     if (cat) u += "&tagtype_0=categories&tag_contains_0=contains&tag_0=" + encodeURIComponent(B.CAT_BY_ID[cat].tag.replace("en:", ""));
-    var d = await getJSON(u);
-    return ((d && d.products) || []).filter(function (p) { return p.code; }).map(norm);
+    var d = await getJSON(u, 25000);
+    return ((d && d.products) || []).filter(function (p) { return p.code; }).map(function (p) { return norm(p); });
+  }
+  var STOPW = { the: 1, and: 1, for: 1, with: 1, of: 1, oz: 1, ml: 1, fl: 1, ct: 1, pack: 1, count: 1, size: 1, new: 1 };
+  function tokens(s) {
+    var t = String(s || "").toLowerCase().replace(/[\u0300-\u036f]/g, "").match(/[a-z0-9]+/g) || [];
+    return t.filter(function (x) { return x.length > 1 && !STOPW[x] && !/^\d+(oz|ml|g|ct|l)?$/.test(x); }).filter(function (x, i, a) { return a.indexOf(x) === i; });
+  }
+  /* Same-name entries in Open Beauty Facts that DO have an ingredient list (never the same barcode). */
+  async function matchesByName(name, brands, exclude) {
+    var bt = tokens(brands).slice(0, 2), nt = tokens(name), qt = bt.concat(nt.filter(function (x) { return bt.indexOf(x) < 0; }));
+    if (!qt.length) return [];
+    var tries = [qt.join(" ")];
+    if (qt.length > 3) tries.push(bt.slice(0, 1).concat(nt.slice(0, 2)).join(" "));
+    for (var i = 0; i < tries.length; i++) {
+      var res = await searchName(tries[i], ""), seen = {}, keep = [];
+      res.forEach(function (r) {
+        if (!r.ing || r.code === exclude || seen[r.code]) return; seen[r.code] = 1;
+        var rt = tokens(r.brands + " " + r.name), hit = qt.filter(function (x) { return rt.indexOf(x) >= 0; }).length / qt.length;
+        if (bt.length && rt.indexOf(bt[0]) < 0) return;
+        if (hit >= 0.5) { r.match = hit; keep.push(r); }
+      });
+      keep.sort(function (a, b) { return (b.us - a.us) || (b.match - a.match); });
+      if (keep.length) return keep.slice(0, 5);
+    }
+    return [];
   }
   async function browseCat(cat, us) {
     var u = OBF + "/api/v2/search?categories_tags=" + encodeURIComponent(B.CAT_BY_ID[cat].tag) + "&page_size=60&sort_by=unique_scans_n&fields=" + FIELDS;
     if (us) u += "&countries_tags=en:united-states";
     var d = await getJSON(u);
-    return ((d && d.products) || []).filter(function (p) { return p.code; }).map(norm);
+    return ((d && d.products) || []).filter(function (p) { return p.code; }).map(function (p) { return norm(p); });
   }
   function analyzeProduct(p) { return B.analyze(overrides()[p.code] || p.ing, p.cat); }
 
   /* ---------- camera ---------- */
   var FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "itf", "codabar"];
+  var STREAM = { audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } };
   async function startNative(video, onCode) {
-    var stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } } });
+    var fmts = FORMATS;
+    try { var sup = await BarcodeDetector.getSupportedFormats(); fmts = FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; }); } catch (e) {}
+    if (!fmts.some(function (f) { return /ean|upc/.test(f); })) throw new Error("No native barcode formats");
+    var stream = await navigator.mediaDevices.getUserMedia(STREAM);
     video.srcObject = stream; video.setAttribute("playsinline", "true"); video.muted = true; await video.play();
-    var det = new BarcodeDetector({ formats: FORMATS }), stopped = false;
-    (function tick() {
+    try { var tr = stream.getVideoTracks()[0], caps = tr.getCapabilities && tr.getCapabilities(); if (caps && caps.focusMode && caps.focusMode.indexOf("continuous") >= 0) await tr.applyConstraints({ advanced: [{ focusMode: "continuous" }] }); } catch (e) {}
+    var det = new BarcodeDetector({ formats: fmts }), stopped = false, last = 0;
+    (function tick(now) {
       if (stopped) return;
+      if (now - last < 90) { requestAnimationFrame(tick); return; }
+      last = now;
       Promise.resolve(video.readyState >= 2 ? det.detect(video) : []).then(function (codes) {
-        if (codes && codes.length && codes[0].rawValue) { onCode(codes[0].rawValue); return; }
-        if (!stopped) requestAnimationFrame(tick);
+        if (stopped) return;
+        if (codes && codes.length && codes[0].rawValue) onCode(codes[0].rawValue);
+        requestAnimationFrame(tick);
       }).catch(function () { if (!stopped) requestAnimationFrame(tick); });
-    })();
+    })(0);
     return { stop: function () { stopped = true; stream.getTracks().forEach(function (t) { t.stop(); }); video.srcObject = null; }, stream: stream };
   }
   async function startZxing(id, onCode) {
     if (typeof Html5Qrcode === "undefined") throw new Error("Scanner library failed to load.");
-    var h = new Html5Qrcode(id, { verbose: false });
-    var F = Html5QrcodeSupportedFormats;
-    await h.start({ facingMode: "environment" }, { fps: 8, qrbox: { width: 260, height: 140 }, formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF] }, function (t) { onCode(t); }, function () {});
+    var h = new Html5Qrcode(id, { verbose: false, experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
+    var F = Html5QrcodeSupportedFormats, w = Math.min(340, Math.floor((document.documentElement.clientWidth || 360) * 0.82));
+    await h.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: w, height: Math.round(w * 0.5) }, videoConstraints: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF] }, function (t) { onCode(t); }, function () {});
     return { stop: function () { return h.stop().then(function () { h.clear(); }).catch(function () {}); }, stream: null };
   }
-  async function stopScan() { if (scanCtl) { try { await scanCtl.stop(); } catch (e) {} scanCtl = null; } }
+  async function stopScan() { scanSession++; if (scanCtl) { try { await scanCtl.stop(); } catch (e) {} scanCtl = null; } }
   function beep() { try { if (navigator.vibrate) navigator.vibrate(80); var c = new (window.AudioContext || window.webkitAudioContext)(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 880; g.gain.value = 0.06; o.connect(g); g.connect(c.destination); o.start(); setTimeout(function () { o.stop(); c.close(); }, 120); } catch (e) {} }
   function cameraHelp(err) {
     var n = (err && (err.name || err.message)) || "";
@@ -244,8 +327,8 @@
       '<p class="lead">Scan toothpaste, mouthwash, shampoo, conditioner, soap, body wash, deodorant or lotion. Every ingredient is explained in plain English and rated <b>Good for you</b>, <b>OK</b> or <b>Bad for you</b>, with hormone-disruptor flags and sources.</p>' +
       '<button type="button" class="btn xl block" id="startScan">📷  Scan barcode</button></div>' +
       '<div id="scanArea" hidden><div class="scan-stage"><video id="scanVideo" playsinline muted autoplay></video><div id="qr-reader" hidden></div>' +
-      '<div class="viewfinder" id="vf"><div class="vf-box"></div></div><div class="scan-msg">Point the camera at the barcode</div>' +
-      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div></div>' +
+      '<div class="viewfinder" id="vf"><div class="vf-box"></div></div><div class="scan-msg" id="scanMsg">Point the camera at the barcode</div><div class="scan-read" id="scanRead" aria-live="polite"></div>' +
+      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div></div>' +
       '<div id="scanHelp"></div>' +
       '<div class="or">or type the barcode</div>' +
       '<form class="card" id="codeForm"><div class="field"><label for="codeIn">Barcode number</label><input id="codeIn" inputmode="numeric" autocomplete="off" placeholder="For example 7891024133545"></div><button type="submit" class="btn block">Look up barcode</button></form>' +
@@ -287,20 +370,49 @@
   }
   async function beginScan() {
     var area = $("#scanArea"), help = $("#scanHelp"); help.innerHTML = ""; area.hidden = false; await stopScan();
-    var video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"); torch.hidden = true;
-    var onCode = function (raw) { var d = digits(raw); if (!d || d.length < 6) return; beep(); stopScan(); location.hash = "#/product/" + d; };
+    var video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"), zoom = $("#zoomBtn"), msg = $("#scanMsg"), read = $("#scanRead");
+    torch.hidden = true; zoom.hidden = true; read.textContent = ""; msg.textContent = "Starting the camera…";
+    var done = false, timers = [], mine = ++scanSession;
+    function clear() { timers.forEach(clearTimeout); timers = []; }
+    function onCode(raw) {
+      if (done || mine !== scanSession) return;
+      var d = digits(raw); if (!d || d.length < 6) return;
+      if (!checkOK(d)) { read.textContent = "Read " + d + " but it does not look right. Hold steady and try again."; return; }
+      done = true; clear(); read.textContent = "Scanned " + d + " ✔"; beep(); stopScan(); setTimeout(function () { location.hash = "#/product/" + d; }, 350);
+    }
+    function wireExtras() {
+      try {
+        var stream = (scanCtl && scanCtl.stream) || video.srcObject || (zx.querySelector("video") || {}).srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
+        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
+        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) { zoom.hidden = false; var z2 = false; zoom.onclick = function () { z2 = !z2; var v = z2 ? Math.min(caps.zoom.max, Math.max(caps.zoom.min * 2, 2)) : caps.zoom.min; track.applyConstraints({ advanced: [{ zoom: v }] }).catch(function () {}); zoom.textContent = z2 ? "Zoom out" : "Zoom"; }; }
+      } catch (e) {}
+    }
+    function hints() {
+      timers.push(setTimeout(function () { if (!done) msg.textContent = "Hold 6 to 8 inches away, keep the barcode flat and well lit. Tap Light if it is dark."; }, 7000));
+      timers.push(setTimeout(function () { if (!done) msg.innerHTML = "Still nothing? You can type the number printed under the barcode, below."; }, 16000));
+    }
+    async function useZxing() {
+      video.hidden = true; vf.hidden = true; zx.hidden = false; msg.textContent = "Point the camera at the barcode";
+      scanCtl = await startZxing("qr-reader", onCode); wireExtras();
+    }
     try {
       if (!window.isSecureContext) throw new Error("Camera needs HTTPS.");
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This browser cannot open the camera.");
+      var native = false;
       if (typeof window.BarcodeDetector === "function") {
-        try { video.hidden = false; zx.hidden = true; vf.hidden = false; scanCtl = await startNative(video, onCode); }
-        catch (e) { video.hidden = true; zx.hidden = false; vf.hidden = true; scanCtl = await startZxing("qr-reader", onCode); }
-      } else { video.hidden = true; zx.hidden = false; vf.hidden = true; scanCtl = await startZxing("qr-reader", onCode); }
-      try {
-        var stream = scanCtl.stream || video.srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
-        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
-      } catch (e) {}
-    } catch (err) { area.hidden = true; help.innerHTML = cameraHelp(err); }
+        try { video.hidden = false; zx.hidden = true; vf.hidden = false; scanCtl = await startNative(video, onCode); native = true; } catch (e) { if (e && /NotAllowed|Permission|denied|NotFound|Requested device/i.test(e.name + " " + e.message)) throw e; }
+      }
+      if (native) {
+        msg.textContent = "Point the camera at the barcode"; wireExtras();
+        /* If the built-in detector reads nothing for 4 seconds, switch to the second scanner (ZXing). */
+        timers.push(setTimeout(async function () {
+          if (done || mine !== scanSession) return;
+          msg.textContent = "Trying a second scanner…"; try { await scanCtl.stop(); } catch (e) {} scanCtl = null;
+          try { await useZxing(); } catch (e) { area.hidden = true; help.innerHTML = cameraHelp(e); }
+        }, 4000));
+      } else { await useZxing(); }
+      hints();
+    } catch (err) { clear(); area.hidden = true; help.innerHTML = cameraHelp(err); }
   }
 
   /* ---------- product ---------- */
@@ -314,25 +426,61 @@
     } else {
       p = cacheGet(code);
       if (!p) {
-        main.innerHTML = '<div class="card"><span class="spin"></span>Looking up ' + esc(code) + " in Open Beauty Facts…</div>";
+        main.innerHTML = '<div class="card"><span class="spin"></span>Looking up ' + esc(code) + " in Open Beauty Facts, Open Products Facts and Open Food Facts…</div>";
         try { p = await lookup(code); } catch (e) {
           var c2 = cacheGet(code);
-          if (!c2) { if (tok === routeToken) main.innerHTML = '<div class="note"><b>Could not reach Open Beauty Facts.</b><br>' + esc(e.message) + '. Check your connection and try again, or <a href="#/check">paste the ingredient list</a>.</div>'; return; }
+          if (!c2) { if (tok === routeToken) main.innerHTML = '<div class="note"><b>Could not reach the product databases.</b><br>' + esc(e.message) + '. Check your connection and try again, or <a href="#/check">paste the ingredient list</a>.</div>'; return; }
           p = c2;
         }
         if (tok !== routeToken) return;
         if (!p) { notFound(code); return; }
-        cachePut(code, p);
+        if (p.ing) cachePut(code, p);
       }
     }
     if (tok !== routeToken) return;
     showProduct(p);
   }
+  function webLinks(q) {
+    var e = encodeURIComponent(q);
+    return '<a class="btn small ghost" target="_blank" rel="noopener" href="https://duckduckgo.com/?q=' + e + '">🔎 DuckDuckGo</a><a class="btn small ghost" target="_blank" rel="noopener" href="https://www.google.com/search?q=' + e + '">🔎 Google</a>';
+  }
+  var MATCH_NOTE = '<p class="small muted" style="margin:0 0 8px">These are <b>different database entries with similar names, not your exact barcode</b>. Formulas can differ by country, size and version, so compare the ingredient list on your package before trusting a rating.</p>';
+  function matchRows(list) {
+    return list.map(function (m) {
+      var an = B.analyze(m.ing, m.cat), q = { code: m.code, name: m.name, brands: m.brands, img: m.img, score: an.enough ? an.score : null };
+      return listRow(q, an, "#/product/" + encodeURIComponent(m.code));
+    }).join("");
+  }
+  async function showNameMatches(box, name, brands, code) {
+    var tok = routeToken;
+    box.innerHTML = '<h2>Similar products that do have ingredients</h2><div class="muted"><span class="spin"></span>Searching Open Beauty Facts for “' + esc(((brands ? brands.split(",")[0] + " " : "") + name).trim()) + "”…</div>";
+    try {
+      var list = await matchesByName(name, brands, code);
+      if (tok !== routeToken) return;
+      box.innerHTML = list.length ? "<h2>Similar products that do have ingredients</h2>" + MATCH_NOTE + '<div class="list">' + matchRows(list) + "</div>" : '<div class="info">No similar product with an ingredient list turned up in Open Beauty Facts.</div>';
+    } catch (e) { if (tok === routeToken) box.innerHTML = '<div class="info">The name search is not available right now (' + esc(e.message) + ").</div>"; }
+  }
   function notFound(code) {
-    main.innerHTML = '<h1>Product not found</h1><div class="card"><p>Barcode <b>' + esc(code) + "</b> is not in the Open Beauty Facts database yet. The app never guesses at products, so nothing is shown for it.</p>" +
-      "<p><b>What you can do:</b></p><ul><li>Type the product name in the search box on the Scan page.</li><li>Paste or photograph the ingredient list from the package below to rate it.</li><li>Add the product to the free database so everyone can find it: <a href=\"https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=" + encodeURIComponent(code) + '" target="_blank" rel="noopener">Open Beauty Facts</a>.</li></ul></div>' +
-      pasteForm("nf", code, "") + '<div id="pasteOut"></div>' + disclaimer();
+    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
+      "<p><b>Three ways to still get a rating:</b></p></div>" +
+      '<div class="card"><h3>1. Search by name</h3><form id="nfForm"><div class="field"><label for="nfName">What is the product called? (brand and name)</label><input id="nfName" autocomplete="off" placeholder="For example Crest Cavity Protection"></div><button type="submit" class="btn block">Find by name</button></form><div id="nfOut" class="search-res" style="margin-top:10px"></div>' +
+      '<div class="row" style="margin-top:8px" id="nfWeb">' + webLinks(code + " barcode") + "</div></div>" +
+      '<div class="card"><h3>2. Read the package</h3><p class="small muted">Photograph or paste the ingredient list from the back of the package, or find the ingredients on the brand’s website with the search links above.</p></div>' +
+      pasteForm("nf", code, "") + '<div id="pasteOut"></div>' +
+      '<div class="card"><h3>3. Help everyone</h3><p class="small">Add the product to the free database: <a href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(code) + '" target="_blank" rel="noopener">Open Beauty Facts</a>.</p></div>' + disclaimer();
     wirePaste("nf", { code: code, name: "Barcode " + code, brands: "", img: "", cat: "" });
+    var rl = $("#retryLook"); if (rl) rl.addEventListener("click", function (e) { e.preventDefault(); renderProduct(code); });
+    $("#nfForm").addEventListener("submit", async function (e) {
+      e.preventDefault(); var q = $("#nfName").value.trim(), out = $("#nfOut"), tok = routeToken;
+      if (q.length < 2) return toast("Type at least 2 letters.");
+      $("#nfWeb").innerHTML = webLinks(q + " ingredients");
+      out.innerHTML = '<div class="muted"><span class="spin"></span>Searching…</div>';
+      try {
+        var res = (await searchName(q, "")).filter(function (r) { return r.ing; });
+        if (tok !== routeToken) return;
+        out.innerHTML = res.length ? MATCH_NOTE + matchRows(res.slice(0, 8)) : '<div class="note">Nothing with an ingredient list matched \u201C' + esc(q) + "”. Try the brand alone or fewer words, or use the search links for “" + esc(q) + " ingredients”.</div>";
+      } catch (er) { out.innerHTML = '<div class="note">Search is not available right now (' + esc(er.message) + ").</div>"; }
+    });
   }
   function showProduct(p) {
     var override = overrides()[p.code];
@@ -344,11 +492,12 @@
       '<div><h1>' + esc(p.name) + '</h1><div class="muted">' + esc(p.brands || "Unknown brand") + (p.qty ? " · " + esc(p.qty) : "") + '</div><div class="row" style="margin-top:6px">' +
       (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
       '<div class="row" style="margin-top:10px"><button class="btn small ' + (fav ? "" : "ghost") + '" id="favBtn">' + (fav ? "★ Saved" : "☆ Save to favorites") + '</button>' +
-      (p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="https://world.openbeautyfacts.org/product/' + encodeURIComponent(p.code) + '">Open Beauty Facts page</a>') +
+      (p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="' + esc(p.srcUrl || ("https://world.openbeautyfacts.org/product/" + encodeURIComponent(p.code))) + '">' + esc(p.srcName || "Open Beauty Facts") + " page</a>") +
       '<button class="btn small ghost" id="editBtn">✏️ Edit ingredient list</button></div></div>';
     var body;
     if (!an.total) {
-      body = '<div class="verdict NA"><div class="big">?<small>NO INGREDIENTS LISTED</small></div><p>Open Beauty Facts has this product but nobody has entered its ingredient list yet, so it cannot be rated. The app does not guess. Read the list off the package and paste it below, or photograph it.</p></div>' +
+      body = '<div class="verdict NA"><div class="big">?<small>NO INGREDIENTS LISTED</small></div><p>' + esc(p.srcName || "Open Beauty Facts") + ' knows this barcode' + (p.name === "Unnamed product" ? " (only a photo, no name)" : " and its name") + ', but nobody has entered the ingredient list yet, so it cannot be rated. The app does not guess. Check the similar products below, read the list off the package and paste it, or photograph it.</p></div>' +
+        (p.pasted ? "" : '<div id="nameBox"></div><div class="card"><h3>Find the ingredients online</h3><div class="row">' + webLinks((p.brands ? p.brands.split(",")[0] + " " : "") + p.name + " ingredients") + "</div></div>") +
         pasteForm("pp", p.code, "");
     } else {
       var pct = an.rated + " of " + an.total + " ingredients recognized" + (an.noise ? "; " + an.noise + " unreadable label text fragment" + (an.noise > 1 ? "s" : "") + " ignored" : "");
@@ -373,6 +522,7 @@
       $$("#ingList .ing").forEach(function (r) { r.hidden = !(f === "all" || (f === "h" ? r.getAttribute("data-h") === "1" : r.getAttribute("data-lv") === f)); });
     });
     animateBars();
+    if (!an.total && !p.pasted && $("#nameBox")) showNameMatches($("#nameBox"), p.name, p.brands, p.code);
     if (an.enough && p.cat && !p.pasted) loadAlternatives(p, an);
   }
   async function loadAlternatives(p, an) {

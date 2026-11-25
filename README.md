@@ -12,3 +12,10 @@ Installable phone/PC web app that scans a toothpaste, mouthwash, shampoo, condit
 Live: https://phillipalvaranga-arch.github.io/body-care-scanner/
 
 Informational only; not medical advice. Ratings summarize what regulators and scientific bodies say, many are dose-dependent or debated, and Open Beauty Facts can be incomplete or wrong.
+
+## Scanning and lookup (v3)
+
+- Scanner: the browser's built-in BarcodeDetector first; if it reads nothing for 4 seconds the app switches to the bundled ZXing scanner. Rear camera, continuous focus, Light and Zoom buttons when the phone supports them. The scanned number is shown on screen and rejected if its check digit is wrong (misread).
+- Lookup: Open Beauty Facts, then Open Products Facts and Open Food Facts, trying UPC-A (12 digits), EAN-13 (leading 0) and UPC-E expansions.
+- If the barcode is known but has no ingredients, or is unknown: search by name in Open Beauty Facts (clearly labelled "similar product, not your barcode"), paste or photograph the ingredient list, or open a DuckDuckGo/Google search for "<name> ingredients". The app never invents ingredients.
+- UPCitemdb and similar UPC-to-name services are not used: they block browser requests (CORS) or need an API key.
