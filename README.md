@@ -30,3 +30,8 @@ Informational only; not medical advice. Ratings summarize what regulators and sc
 Each row keeps its source URL and the date the source says it was last updated. Scanned barcodes are checked against this library first (12- and 13-digit forms), then Open Beauty Facts, Open Products Facts and Open Food Facts. Name search and the best-rated lists include it. Build scripts are in `tools/us-library/`. Nothing is invented: a product is included only when its source gives both the UPC and the ingredient list.
 
 The "US products only" switch (on by default) limits Open Beauty Facts searches, best-rated lists and suggestions to products sold in the US (using us.openbeautyfacts.org and the countries field).
+
+
+## Add a product (v5)
+
+If a barcode is not in the app, you can add it yourself: name, brand, type, optional size and front photo, and the ingredient list (typed, pasted, or read from a photo on the device). The live preview shows the GOOD / OK / BAD rating before you save. Products are stored only on this device (IndexedDB, with compressed photos), are checked first on future scans, and appear in name search and best-rated lists with an “Added by you” tag. Edit, delete, and export or import a backup JSON file from the My products tab. Sharing to Open Beauty Facts is optional and opens their add-product page — the app never uploads for you.

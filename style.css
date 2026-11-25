@@ -170,3 +170,8 @@ details.faq summary{cursor:pointer;font-weight:700}
 .viewfinder[hidden]{display:none}
 .srcline{margin-top:10px;font-size:.86rem;color:var(--mut);line-height:1.45;overflow-wrap:anywhere}
 .srcline a{color:var(--acc)}
+
+.photo-prev img{width:84px;height:84px;object-fit:cover;border-radius:12px;border:1px solid var(--line);background:var(--bg)}
+.add-actions{position:sticky;bottom:calc(var(--tab-h) + var(--sb));background:var(--bg);padding:12px 0 8px;margin-top:16px;z-index:8;border-top:1px solid var(--line)}
+#livePrev .verdict{margin-top:0}
+.tabs button{min-width:56px}

@@ -10,7 +10,7 @@
   ];
   var FIELDS = "code,product_name,product_name_en,brands,quantity,ingredients_text,ingredients_text_en,image_front_small_url,categories_tags,countries_tags";
   var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only", usOnly: "bcs-us-only" };
-  var VERSION = "bodycare-v4";
+  var VERSION = "bodycare-v5";
   var main = document.getElementById("main");
   var toastEl = document.getElementById("toast");
   var themeBtn = document.getElementById("themeBtn");
@@ -58,6 +58,111 @@
   function setOverride(code, text) { var o = overrides(); o[code] = text; var ks = Object.keys(o); if (ks.length > 60) delete o[ks[0]]; save(KEYS.over, o); }
   function cacheGet(c) { var x = load(KEYS.cache, {})[c]; return x && Date.now() - x.t < 7 * 864e5 ? x.p : null; }
   function cachePut(c, p) { var o = load(KEYS.cache, {}); o[c] = { t: Date.now(), p: p }; var ks = Object.keys(o); if (ks.length > 40) { ks.sort(function (a, b) { return o[a].t - o[b].t; }).slice(0, ks.length - 40).forEach(function (k) { delete o[k]; }); } save(KEYS.cache, o); }
+
+  /* ---------- My products (on this device only) ---------- */
+  var MINE = null, idbP = null;
+  function idbOpen() {
+    if (idbP) return idbP;
+    idbP = new Promise(function (res, rej) {
+      if (!window.indexedDB) { idbP = null; return rej(new Error("no-idb")); }
+      var r = indexedDB.open("bcs-mine", 1);
+      r.onupgradeneeded = function () { r.result.createObjectStore("products", { keyPath: "code" }); };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { idbP = null; rej(r.error); };
+    });
+    return idbP;
+  }
+  function idbReq(req) { return new Promise(function (res, rej) { req.onsuccess = function () { res(req.result); }; req.onerror = function () { rej(req.error); }; }); }
+  async function mineAll() {
+    if (MINE) return MINE;
+    try {
+      var db = await idbOpen();
+      MINE = (await idbReq(db.transaction("products").objectStore("products").getAll())) || [];
+    } catch (e) {
+      MINE = load("bcs-mine", []);
+    }
+    return MINE;
+  }
+  function mineProduct(r) {
+    return { code: r.code, name: r.name, brands: r.brands || "", qty: r.qty || "", img: r.img || "", ing: r.ing || "", cat: r.cat || "", tags: [], us: true, srcName: "Added by you", srcUrl: "", mine: true, added: r.added, updated: r.updated };
+  }
+  function mineMatch(rec, raw) {
+    if (rec.code === raw) return true;
+    var a = candidates(rec.code), b = candidates(raw);
+    return a.some(function (x) { return b.indexOf(x) >= 0; });
+  }
+  async function mineLookup(raw) {
+    if (!raw) return null;
+    var all = await mineAll(), i;
+    for (i = 0; i < all.length; i++) if (mineMatch(all[i], raw)) return mineProduct(all[i]);
+    return null;
+  }
+  async function mineByCat(cat) {
+    return (await mineAll()).filter(function (r) { return !cat || r.cat === cat; }).map(mineProduct);
+  }
+  async function mineSearch(q, cat) {
+    var qt = tokens(q), all = await mineAll(), out = [];
+    if (!qt.length && !cat) return [];
+    all.forEach(function (r) {
+      if (cat && r.cat !== cat) return;
+      if (!qt.length) { out.push({ r: r, s: 1 }); return; }
+      var rt = tokens(r.brands + " " + r.name), hit = qt.filter(function (x) { return rt.indexOf(x) >= 0 || rt.some(function (y) { return y.length > 3 && x.length > 3 && (y.indexOf(x) === 0 || x.indexOf(y) === 0); }); }).length;
+      if (hit === qt.length || (qt.length >= 3 && hit >= qt.length - 1) || (hit >= 1 && qt.length === 1)) out.push({ r: r, s: hit / Math.max(qt.length, 1) });
+    });
+    out.sort(function (a, b) { return b.s - a.s; });
+    return out.map(function (o) { return mineProduct(o.r); });
+  }
+  async function minePut(rec) {
+    rec.updated = Date.now();
+    if (!rec.added) rec.added = rec.updated;
+    try {
+      var db = await idbOpen();
+      await idbReq(db.transaction("products", "readwrite").objectStore("products").put(rec));
+    } catch (e) {
+      var list = load("bcs-mine", []).filter(function (x) { return x.code !== rec.code; });
+      try { save("bcs-mine", [rec].concat(list)); } catch (err) { throw new Error("Could not save on this device. Storage may be full. Try a smaller photo, or export a backup and delete an older product."); }
+    }
+    MINE = null;
+  }
+  async function mineDel(code) {
+    try {
+      var db = await idbOpen(), rec = await mineLookup(code);
+      if (rec) await idbReq(db.transaction("products", "readwrite").objectStore("products").delete(rec.code));
+    } catch (e) {
+      save("bcs-mine", load("bcs-mine", []).filter(function (x) { return !mineMatch(x, code); }));
+    }
+    MINE = null;
+    save(KEYS.hist, histList().filter(function (x) { return x.code !== code; }));
+    save(KEYS.fav, favList().filter(function (x) { return x.code !== code; }));
+    var o = overrides(); if (o[code]) { delete o[code]; save(KEYS.over, o); }
+  }
+  function compressPhoto(file, maxSide, quality) {
+    return new Promise(function (res, rej) {
+      if (!file) return res("");
+      var url = URL.createObjectURL(file), img = new Image();
+      img.onload = function () {
+        var scale = Math.min(1, (maxSide || 900) / Math.max(img.width, img.height)), c = document.createElement("canvas");
+        c.width = Math.max(1, Math.round(img.width * scale)); c.height = Math.max(1, Math.round(img.height * scale));
+        c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        res(c.toDataURL("image/jpeg", quality || 0.72));
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); rej(new Error("Could not read that photo.")); };
+      img.src = url;
+    });
+  }
+  function fmtWhen(ts) {
+    if (!ts) return "";
+    var d = new Date(ts);
+    return ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()] + " " + d.getDate() + ", " + d.getFullYear();
+  }
+  function addThisBtn(p) {
+    return '<a class="btn xl block" id="addThis" href="#/add/' + encodeURIComponent(p.code || "") + '">➕  Add this product</a><p class="small muted">Save the barcode and ingredient list on this device so the next scan finds it. Nothing is uploaded.</p>';
+  }
+  function stashDraft(p) {
+    try { sessionStorage.setItem("bcs-add-draft", JSON.stringify({ code: p.code || "", name: p.name && p.name.indexOf("Barcode ") === 0 ? "" : (p.name || ""), brands: p.brands || "", cat: p.cat || "", qty: p.qty || "", ing: p.ing || "" })); } catch (e) {}
+  }
+
 
   /* ---------- Open Beauty Facts ---------- */
   function digits(s) { return String(s || "").replace(/\D/g, ""); }
@@ -123,6 +228,8 @@
     var list = candidates(raw);
     if (!list.length) throw new Error("Enter a barcode number.");
     lookupIssues = [];
+    var fromMine = await mineLookup(raw);
+    if (fromMine) return fromMine;
     var fromLib = await libLookup(raw);
     if (fromLib) return fromLib;
     var all = [];
@@ -152,12 +259,18 @@
     return us ? res.filter(function (p) { return p.us; }) : res;
   }
   /* Built-in US library first, then Open Beauty Facts. */
+  function unseen(seen, p) {
+    var k = p.code.length === 13 && p.code[0] === "0" ? p.code.slice(1) : p.code;
+    if (seen[k] || seen[p.code]) return false;
+    seen[k] = seen[p.code] = 1; return true;
+  }
   async function searchName(q, cat) {
+    var mine = await mineSearch(q, cat).catch(function () { return []; });
     var lib = await libSearch(q, cat).catch(function () { return []; }), obf = [], err = null;
     try { obf = await searchOBF(q, cat); } catch (e) { err = e; }
-    if (err && !lib.length) throw err;
-    var seen = {}; lib.forEach(function (p) { seen[p.code] = 1; });
-    return lib.concat(obf.filter(function (p) { var k = p.code.length === 13 && p.code[0] === "0" ? p.code.slice(1) : p.code; return !seen[k] && !seen[p.code]; }));
+    if (err && !lib.length && !mine.length) throw err;
+    var seen = {};
+    return mine.filter(function (p) { return unseen(seen, p); }).concat(lib.filter(function (p) { return unseen(seen, p); }), obf.filter(function (p) { return unseen(seen, p); }));
   }
   /* ---------- built-in US product library (data/us-products.json) ---------- */
   var LIB = null, LIBP = null;
@@ -279,11 +392,15 @@
     routeToken++;
     var parts = (location.hash || "#/scan").replace(/^#\/?/, "").split("/").filter(Boolean);
     var page = parts[0] || "scan";
-    $$(".tabs button").forEach(function (b) { var on = b.getAttribute("data-go") === (page === "product" || page === "browse" ? "scan" : page); if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
+    var tab = page === "product" || page === "browse" ? "scan" : (page === "add" || page === "edit" || page === "mine" ? "mine" : page);
+    $$(".tabs button").forEach(function (b) { var on = b.getAttribute("data-go") === tab; if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current"); });
     stopScan();
     window.scrollTo(0, 0);
     if (page === "product" && parts[1]) return renderProduct(decodeURIComponent(parts[1]));
     if (page === "browse" && parts[1]) return renderBrowse(parts[1]);
+    if (page === "add") return renderAdd(parts[1] ? decodeURIComponent(parts[1]) : "", false);
+    if (page === "edit" && parts[1]) return renderAdd(decodeURIComponent(parts[1]), true);
+    if (page === "mine") return renderMine();
     if (page === "check") return renderCheck();
     if (page === "history") return renderList("history");
     if (page === "favorites") return renderList("favorites");
@@ -372,7 +489,7 @@
   }
   function listRow(p, an, href) {
     return '<a class="item" href="' + href + '">' + (p.img ? '<img loading="lazy" src="' + esc(p.img) + '" alt="">' : '<div class="ph" aria-hidden="true">🧴</div>') +
-      '<div class="meta"><b>' + esc(p.name) + '</b><div class="sub">' + esc(p.brands || "Unknown brand") + (p.score != null ? " · Score " + p.score : "") + (p.lib ? " · 🇺🇸 maker label" : "") + "</div></div>" +
+      '<div class="meta"><b>' + esc(p.name) + '</b><div class="sub">' + esc(p.brands || "Unknown brand") + (p.score != null ? " · Score " + p.score : "") + (p.lib ? " · 🇺🇸 maker label" : "") + (p.mine ? " · Added by you" : "") + "</div></div>" +
       '<div class="row" style="justify-content:flex-end;flex:none;max-width:110px">' + vbadge(an ? an.verdict : p.verdict) + ((an ? an.endoDirect.length : p.endo) ? '<span class="badge hor" title="Hormone-disruptor flag">⚠ Hormone</span>' : "") + "</div></a>";
   }
 
@@ -392,6 +509,9 @@
       '<form class="card" id="nameForm"><div class="field"><label for="nameIn">Product name or brand</label><input id="nameIn" autocomplete="off" placeholder="For example Colgate, Listerine, Dove"></div>' +
       '<div class="small muted">Optional: pick a type to narrow the search, or to see the best-rated products of that type.</div>' + catChips(selCat, "chips") +
       ''+ usToggle("usOnlyHome") + '<button type="submit" class="btn block ghost">Search</button><div id="browseLink"></div><div id="searchOut" class="search-res"></div></form>' +
+      '<div class="or">or add a product yourself</div>' +
+      '<a class="btn xl block" href="#/add">➕  Add a product</a>' +
+      '<p class="small muted" style="margin-top:8px">Save a barcode and ingredient list on this phone. The next time you scan it, the app will find <b>your</b> copy. Nothing is sent off this device. <a href="#/mine">See my products</a>.</p>' +
       '<div class="or">or use the ingredient list</div><a class="btn ghost block" href="#/check">📝 Paste or photograph the ingredient list</a>' +
       recentStrip() + disclaimer();
     $("#startScan").addEventListener("click", beginScan);
@@ -420,7 +540,7 @@
       if (!res.length) { out.innerHTML = '<div class="note">Nothing found for \u201C' + esc(q) + '\u201D' + (selCat ? " in that type" : "") + ". Try the brand alone, a shorter name, or <a href=\"#/check\">paste the ingredient list</a>.</div>"; return; }
       out.innerHTML = res.map(function (p) {
         var an = p.ing ? B.analyze(p.ing, p.cat) : null;
-        var q2 = { code: p.code, name: p.name, brands: p.brands, img: p.img, lib: !!p.lib, score: an && an.enough ? an.score : null };
+        var q2 = { code: p.code, name: p.name, brands: p.brands, img: p.img, lib: !!p.lib, mine: !!p.mine, score: an && an.enough ? an.score : null };
         return listRow(q2, an || { verdict: null, endoDirect: [] }, "#/product/" + encodeURIComponent(p.code));
       }).join("");
     } catch (e) { out.innerHTML = '<div class="note">Search is not available right now (' + esc(e.message) + "). Check your connection or type the barcode.</div>"; }
@@ -475,7 +595,9 @@
   /* ---------- product ---------- */
   async function renderProduct(code) {
     var tok = routeToken;
-    var p = null;
+    var p = await mineLookup(code);
+    if (p) { if (tok === routeToken) showProduct(p); return; }
+    if (/^m\d+$/.test(code)) { main.innerHTML = '<div class="card">That saved product was not found. It may have been deleted. <a href="#/mine">My products</a> · <a href="#/add">Add a product</a>.</div>'; return; }
     if (/^p\d+$/.test(code)) {
       var h = histList().concat(favList()).filter(function (x) { return x.code === code; })[0];
       if (!h || !h.ing) { main.innerHTML = '<div class="card">That saved list was not found. <a href="#/check">Check a new list</a>.</div>'; return; }
@@ -504,7 +626,7 @@
   var MATCH_NOTE = '<p class="small muted" style="margin:0 0 8px">These are <b>different database entries with similar names, not your exact barcode</b>. Formulas can differ by country, size and version, so compare the ingredient list on your package before trusting a rating.</p>';
   function matchRows(list) {
     return list.map(function (m) {
-      var an = B.analyze(m.ing, m.cat), q = { code: m.code, name: m.name, brands: m.brands, img: m.img, lib: !!m.lib, score: an.enough ? an.score : null };
+      var an = B.analyze(m.ing, m.cat), q = { code: m.code, name: m.name, brands: m.brands, img: m.img, lib: !!m.lib, mine: !!m.mine, score: an.enough ? an.score : null };
       return listRow(q, an, "#/product/" + encodeURIComponent(m.code));
     }).join("");
   }
@@ -518,13 +640,16 @@
     } catch (e) { if (tok === routeToken) box.innerHTML = '<div class="info">The name search is not available right now (' + esc(e.message) + ").</div>"; }
   }
   function notFound(code) {
-    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in the built-in US library (" + (LIB ? LIB.d.rows.length.toLocaleString() : "2,000+") + " products), Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
-      "<p><b>Three ways to still get a rating:</b></p></div>" +
+    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card">' + addThisBtn({ code: code }) + '</div>' +
+      '<div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in the built-in US library (" + (LIB ? LIB.d.rows.length.toLocaleString() : "2,000+") + " products), Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
+      "<p><b>Other ways to still get a rating:</b></p></div>" +
       '<div class="card"><h3>1. Search by name</h3><form id="nfForm"><div class="field"><label for="nfName">What is the product called? (brand and name)</label><input id="nfName" autocomplete="off" placeholder="For example Crest Cavity Protection"></div>'+ usToggle("usOnlyNf") + '<button type="submit" class="btn block">Find by name</button></form><div id="nfOut" class="search-res" style="margin-top:10px"></div>' +
       '<div class="row" style="margin-top:8px" id="nfWeb">' + webLinks(code + " barcode") + "</div></div>" +
       '<div class="card"><h3>2. Read the package</h3><p class="small muted">Photograph or paste the ingredient list from the back of the package, or find the ingredients on the brand’s website with the search links above.</p></div>' +
       pasteForm("nf", code, "") + '<div id="pasteOut"></div>' +
       '<div class="card"><h3>3. Help everyone</h3><p class="small">Add the product to the free database: <a href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(code) + '" target="_blank" rel="noopener">Open Beauty Facts</a>.</p></div>' + disclaimer();
+    stashDraft({ code: code });
+    var at0 = $("#addThis"); if (at0) at0.addEventListener("click", function () { stashDraft({ code: code }); });
     wirePaste("nf", { code: code, name: "Barcode " + code, brands: "", img: "", cat: "" });
     wireUs("usOnlyNf", function () { if ($("#nfName").value.trim().length >= 2) $("#nfForm").requestSubmit(); });
     var rl = $("#retryLook"); if (rl) rl.addEventListener("click", function (e) { e.preventDefault(); renderProduct(code); });
@@ -555,16 +680,21 @@
     remember(p, an);
     var cat = p.cat ? B.CAT_BY_ID[p.cat] : null;
     var fav = isFav(p.code);
-    var srcLine = p.lib ? '<div class="srcline">Ingredients from <a href="' + esc(p.srcUrl) + '" target="_blank" rel="noopener">' + esc(p.srcName) + "</a>, checked " + esc(fmtDate(p.lib.checked)) + (p.lib.updated ? " (source updated " + esc(fmtDate(p.lib.updated)) + ")" : "") + "." + (p.lib.active ? "<br>Active ingredient (drug facts): " + esc(p.lib.active.replace(/^\s*active ingredients?\s*(\([^)]*\))?\s*[:\-]?\s*/i, "").replace(/\s*purposes?\b.*$/i, "")) : "") + "</div>" : "";
+    var srcLine = p.mine ? '<div class="srcline">Added by you' + (p.updated ? " on " + esc(fmtWhen(p.updated)) : "") + '. Saved only on this device. <a href="#/edit/' + encodeURIComponent(p.code) + '">Edit</a>.</div>'
+      : p.lib ? '<div class="srcline">Ingredients from <a href="' + esc(p.srcUrl) + '" target="_blank" rel="noopener">' + esc(p.srcName) + "</a>, checked " + esc(fmtDate(p.lib.checked)) + (p.lib.updated ? " (source updated " + esc(fmtDate(p.lib.updated)) + ")" : "") + "." + (p.lib.active ? "<br>Active ingredient (drug facts): " + esc(p.lib.active.replace(/^\s*active ingredients?\s*(\([^)]*\))?\s*[:\-]?\s*/i, "").replace(/\s*purposes?\b.*$/i, "")) : "") + "</div>" : "";
     var head = '<div class="card"><div class="prodhead">' + (p.img ? '<img src="' + esc(p.img) + '" alt="">' : '<div class="ph" style="width:84px;height:84px;display:flex;align-items:center;justify-content:center;font-size:2.4rem" aria-hidden="true">🧴</div>') +
       '<div><h1>' + esc(p.name) + '</h1><div class="muted">' + esc(p.brands || "Unknown brand") + (p.qty ? " · " + esc(p.qty) : "") + '</div><div class="row" style="margin-top:6px">' +
-      (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.lib ? '<span class="chip low">🇺🇸 US maker label</span>' : "") + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
+      (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.mine ? '<span class="chip low">Added by you</span>' : "") + (p.lib ? '<span class="chip low">🇺🇸 US maker label</span>' : "") + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
       '<div class="row" style="margin-top:10px"><button class="btn small ' + (fav ? "" : "ghost") + '" id="favBtn">' + (fav ? "★ Saved" : "☆ Save to favorites") + '</button>' +
-      (p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="' + esc(p.srcUrl || ("https://world.openbeautyfacts.org/product/" + encodeURIComponent(p.code))) + '">' + (p.lib ? "Maker label source" : esc(p.srcName || "Open Beauty Facts") + " page") + "</a>") +
-      '<button class="btn small ghost" id="editBtn">✏️ Edit ingredient list</button></div>' + srcLine + '</div>';
+      (p.mine ? '<a class="btn small" href="#/edit/' + encodeURIComponent(p.code) + '">✏️ Edit product</a><button type="button" class="btn small danger" id="delMine">Delete</button>' :
+        ((p.pasted ? "" : '<a class="btn small ghost" target="_blank" rel="noopener" href="' + esc(p.srcUrl || ("https://world.openbeautyfacts.org/product/" + encodeURIComponent(p.code))) + '">' + (p.lib ? "Maker label source" : esc(p.srcName || "Open Beauty Facts") + " page") + "</a>") +
+        '<button class="btn small ghost" id="editBtn">✏️ Edit ingredient list</button>')) +
+      (p.mine && !/^m\d+$/.test(p.code) ? '<a class="btn small ghost" target="_blank" rel="noopener" href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(p.code) + '">Also share it to Open Beauty Facts</a>' : "") +
+      '</div>' + srcLine + '</div>';
     var body;
     if (!an.total) {
-      body = '<div class="verdict NA"><div class="big">?<small>NO INGREDIENTS LISTED</small></div><p>' + esc(p.srcName || "Open Beauty Facts") + ' knows this barcode' + (p.name === "Unnamed product" ? " (only a photo, no name)" : " and its name") + ', but nobody has entered the ingredient list yet, so it cannot be rated. The app does not guess. Check the similar products below, read the list off the package and paste it, or photograph it.</p></div>' +
+      body = '<div class="verdict NA"><div class="big">?<small>NO INGREDIENTS LISTED</small></div><p>' + esc(p.srcName || "Open Beauty Facts") + ' knows this barcode' + (p.name === "Unnamed product" ? " (only a photo, no name)" : " and its name") + ', but nobody has entered the ingredient list yet, so it cannot be rated. The app does not guess. Add it yourself, check the similar products below, or read the list off the package.</p></div>' +
+        (p.mine || p.pasted ? "" : '<div class="card">' + addThisBtn(p) + "</div>") +
         (p.pasted ? "" : '<div id="nameBox"></div><div class="card"><h3>Find the ingredients online</h3><div class="row">' + webLinks((p.brands ? p.brands.split(",")[0] + " " : "") + p.name + " ingredients") + "</div></div>") +
         pasteForm("pp", p.code, "");
     } else {
@@ -580,8 +710,18 @@
         '<details class="faq"><summary>Is something missing or wrong?</summary><p class="small">The ingredient list comes from Open Beauty Facts, where volunteers type it in. If it does not match the package, edit it here (it stays on your device) or fix it on Open Beauty Facts for everyone.</p>' + pasteForm("pp2", p.code, p.ing) + "</details>";
     }
     main.innerHTML = head + body + '<div id="pasteOut"></div>' + disclaimer();
-    $("#favBtn").addEventListener("click", function () { toggleFav(p, an); showProduct(p); });
-    $("#editBtn").addEventListener("click", function () { var f = $("#pf-pp2") || $("#pf-pp"); if (f) { var d = f.closest("details"); if (d) d.open = true; f.scrollIntoView({ behavior: "smooth", block: "center" }); f.focus(); } });
+    var favB = $("#favBtn"); if (favB) favB.addEventListener("click", function () { toggleFav(p, an); showProduct(p); });
+    var edB = $("#editBtn"); if (edB) edB.addEventListener("click", function () { var f = $("#pf-pp2") || $("#pf-pp"); if (f) { var d = f.closest("details"); if (d) d.open = true; f.scrollIntoView({ behavior: "smooth", block: "center" }); f.focus(); } });
+    var at = $("#addThis"); if (at) at.addEventListener("click", function () { stashDraft(p); });
+    var delB = $("#delMine"); if (delB) delB.addEventListener("click", async function () {
+      if (!confirm("Remove “" + p.name + "” from this device? This cannot be undone unless you have a backup file.")) return;
+      await mineDel(p.code); toast("Removed from this device"); location.hash = "#/mine";
+    });
+    if (an.total && !an.enough && !p.mine && !p.pasted && $("#ingList")) {
+      var more = document.createElement("div"); more.className = "card"; more.innerHTML = "<p><b>Not enough data to rate this confidently.</b> You can add your own copy with a fuller ingredient list from the package.</p>" + addThisBtn(p);
+      var listEl = $("#ingList"); if (listEl && listEl.parentNode) listEl.parentNode.insertBefore(more, listEl);
+      var at2 = $("#addThis"); if (at2) at2.addEventListener("click", function () { stashDraft(p); });
+    }
     ["pp", "pp2"].forEach(function (id) { if ($("#pf-" + id)) wirePaste(id, p); });
     var flt = $("#ingFilters");
     if (flt) flt.addEventListener("click", function (e) {
@@ -598,9 +738,9 @@
     var box = $("#altBox"); if (!box) return; var tok = routeToken;
     box.innerHTML = '<h2>Cleaner picks in the same category</h2><div class="muted"><span class="spin"></span>Looking for better-rated products in Open Beauty Facts…</div>';
     try {
-      var lib = await libByCat(p.cat).catch(function () { return []; }), list = [];
-      try { list = await browseCat(p.cat, true); if (!usOnly() && list.length < 8) list = list.concat(await browseCat(p.cat, false)); } catch (e) { if (!lib.length) throw e; }
-      list = lib.concat(list);
+      var mine = await mineByCat(p.cat).catch(function () { return []; }), lib = await libByCat(p.cat).catch(function () { return []; }), list = [];
+      try { list = await browseCat(p.cat, true); if (!usOnly() && list.length < 8) list = list.concat(await browseCat(p.cat, false)); } catch (e) { if (!lib.length && !mine.length) throw e; }
+      list = mine.concat(lib, list);
       if (tok !== routeToken) return;
       var seen = {}, scored = [];
       list.forEach(function (q) {
@@ -617,7 +757,7 @@
       var html = "<h2>Cleaner picks in the same category</h2>";
       if (!better.length) html += '<div class="info">No clearly better-rated product turned up among the most-scanned ' + esc(B.CAT_BY_ID[p.cat].label.toLowerCase()) + " products in Open Beauty Facts. <a href=\"#/browse/" + p.cat + '">Browse the best-rated ones</a>.</div>';
       else html += '<p class="muted small" style="margin-top:-6px">Real products from Open Beauty Facts in the same category with a higher score from this app and no extra hormone flags' + (p.cat === "toothpaste" && curF ? " (and still containing fluoride, which the ADA and CDC recommend for cavity protection)" : "") + '. Ratings are computed from each listed ingredient list; check the package.</p><div class="alt">' +
-        better.map(function (s) { var q = { code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, score: s.a.score }; return listRow(q, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div>";
+        better.map(function (s) { var q = { code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, mine: !!s.p.mine, score: s.a.score }; return listRow(q, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div>";
       box.innerHTML = html;
     } catch (e) { if (tok === routeToken) box.innerHTML = ""; }
   }
@@ -679,7 +819,7 @@
     var list = kind === "history" ? histList() : favList();
     var only = !!load(KEYS.hormOnly, false);
     var shown = only ? list.filter(function (x) { return !x.endo && x.verdict; }) : list;
-    main.innerHTML = "<h1>" + (kind === "history" ? "Scan history" : "Favorites") + "</h1><p class=\"lead\">Saved only on this device.</p>" +
+    main.innerHTML = "<h1>" + (kind === "history" ? "Scan history" : "Favorites") + "</h1><p class=\"lead\">Saved only on this device. To keep a product that is not in the app, <a href=\"#/add\">add it</a> or open <a href=\"#/mine\">My products</a>.</p>" +
       (list.length ? '<label class="switch"><input type="checkbox" id="hOnly" ' + (only ? "checked" : "") + '> Only show products with no hormone-disruptor flags</label>' : "") +
       (shown.length ? '<div class="list">' + shown.map(function (it) { return listRow(it, null, "#/product/" + encodeURIComponent(it.code)); }).join("") + "</div>" :
         '<div class="card">' + (list.length ? "No saved products without hormone flags." : kind === "history" ? "Nothing scanned yet. <a href=\"#/scan\">Scan a product</a>." : "No favorites yet. Open a product and tap Save to favorites.") + "</div>") +
@@ -695,9 +835,9 @@
     main.innerHTML = "<h1>" + c.icon + " Best-rated " + esc(c.label.toLowerCase()) + "</h1><p class=\"lead\">Real products from the built-in US library (ingredient lists from the makers’ own labels) and Open Beauty Facts, re-rated by this app from their listed ingredients. Only products with an ingredient list are shown.</p>" +
       '<label class="switch"><input type="checkbox" id="bh" ' + (only ? "checked" : "") + '> Hide products with hormone-disruptor flags</label>' + usToggle("busOnly") + (cat === "toothpaste" ? '<label class="switch"><input type="checkbox" id="bf" checked> Only toothpastes with fluoride (the ADA and CDC recommend fluoride for cavity protection; this rating does not reward it)</label>' : "") + '<div id="bout"><span class="spin"></span>Loading…</div>' + disclaimer();
     try {
-      var lib = await libByCat(cat).catch(function () { return []; }), list = [];
-      try { list = await browseCat(cat, true); if (!usOnly() && list.length < 15) list = list.concat(await browseCat(cat, false)); } catch (e) { if (!lib.length) throw e; }
-      list = lib.concat(list);
+      var mine = await mineByCat(cat).catch(function () { return []; }), lib = await libByCat(cat).catch(function () { return []; }), list = [];
+      try { list = await browseCat(cat, true); if (!usOnly() && list.length < 15) list = list.concat(await browseCat(cat, false)); } catch (e) { if (!lib.length && !mine.length) throw e; }
+      list = mine.concat(lib, list);
       if (tok !== routeToken) return;
       var seen = {}, rows = [];
       list.forEach(function (q) { var dk = dkey(q); if (seen[q.code] || seen[dk] || !q.ing) return; seen[q.code] = 1; seen[dk] = 1; var a = B.analyze(q.ing, cat); if (a.enough && a.total >= 5) rows.push({ p: q, a: a }); });
@@ -706,7 +846,7 @@
         var hide = $("#bh").checked; save(KEYS.hormOnly, hide);
         var r = hide ? rows.filter(function (x) { return !x.a.endoDirect.length; }) : rows;
         if ($("#bf") && $("#bf").checked) r = r.filter(function (x) { return x.a.items.some(function (i) { return i.rated && i.entry.id === "fluoride"; }); });
-        $("#bout").innerHTML = r.length ? '<div class="list">' + r.slice(0, 30).map(function (s) { return listRow({ code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, score: s.a.score }, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div><p class=\"fine\">" + rows.length + " products with readable ingredient lists were rated. Open Beauty Facts does not have every product.</p>" : '<div class="card">No products to show with that filter.</div>';
+        $("#bout").innerHTML = r.length ? '<div class="list">' + r.slice(0, 30).map(function (s) { return listRow({ code: s.p.code, name: s.p.name, brands: s.p.brands, img: s.p.img, lib: !!s.p.lib, mine: !!s.p.mine, score: s.a.score }, s.a, "#/product/" + encodeURIComponent(s.p.code)); }).join("") + "</div><p class=\"fine\">" + rows.length + " products with readable ingredient lists were rated. Open Beauty Facts does not have every product.</p>" : '<div class="card">No products to show with that filter.</div>';
       }
       wireUs("busOnly", function () { renderBrowse(cat); });
       $("#bh").addEventListener("change", draw); if ($("#bf")) $("#bf").addEventListener("change", draw); draw();
@@ -735,6 +875,7 @@
       "<p><b>Score:</b> starts at 100. Each ingredient group takes off points (OK about 6, Bad about 18, or an amount set for that ingredient). Ingredients beyond the first 10 on the label count at 75%, since they are in smaller amounts. Similar ingredients count once. Unrecognized ingredients are not counted.</p></div>" +
       '<div class="card"><h3>Where the facts come from</h3><p>Products and ingredient lists: <a href="https://world.openbeautyfacts.org" target="_blank" rel="noopener">Open Beauty Facts</a>, a free crowd-sourced database. It does not have every product, and entries can be wrong or incomplete. Ingredient notes: FDA, EU Cosmetics Regulation and the EU\u2019s SCCS scientific opinions, NIH/NIEHS, CDC, ADA, National Cancer Institute, IARC, the Cosmetic Ingredient Review, PubMed and, as a secondary source only, EWG Skin Deep. Every ingredient lists its sources.</p><p>Fluoride is explained honestly: the ADA and CDC support it for preventing cavities; the concern is children swallowing too much.</p></div>' +
       '<h2>Ingredient dictionary</h2><div class="field"><input type="search" id="dq" placeholder="Search ingredients, for example paraben or fluoride" autocomplete="off"></div><label class="switch"><input type="checkbox" id="dh"> Hormone-flagged only</label><div id="dout"></div>' +
+      '<div class="card"><h3>Add a product and back it up</h3><p>If a scan finds nothing, you can <a href="#/add">add the product yourself</a>. The barcode, name and ingredient list stay on this device and are checked first the next time you scan that barcode. Use <a href="#/mine">My products</a> to edit, delete, or export a backup file you can import later (for example after switching phones). Nothing is sent to us. Sharing to Open Beauty Facts is optional and opens their site — this app never uploads for you.</p></div>' +
       disclaimer() + '<p class="fine">Body Care Scanner · ' + VERSION + "</p>";
     function draw() {
       var q = B.norm($("#dq").value), h = $("#dh").checked;
@@ -749,6 +890,189 @@
     }
     $("#dq").addEventListener("input", draw); $("#dh").addEventListener("change", draw); draw();
   }
+
+  /* ---------- add / edit / my products ---------- */
+  function previewBox(text, cat) {
+    var t = (text || "").trim();
+    if (t.length < 3) return '<div class="info">Add the ingredient list to see a live rating. The app does not guess missing ingredients.</div>';
+    var an = B.analyze(t, cat);
+    if (!an.total) return '<div class="info">No ingredients could be read from that text yet. Separate them with commas.</div>';
+    var pct = an.rated + " of " + an.total + " ingredients recognized";
+    return verdictHTML(an, '<p class="small" style="opacity:.9">' + esc(pct) + ".</p>") +
+      '<div class="counts"><div class="count g">' + an.counts.low + "<small>Good for you</small></div><div class=\"count o\">" + an.counts.mod + "<small>OK</small></div><div class=\"count b\">" + an.counts.high + "<small>Bad for you</small></div><div class=\"count u\">" + an.counts.unrated + "<small>Not rated</small></div></div>" +
+      hormoneBox(an) +
+      '<h3>Ingredients, in the order you entered them</h3><div id="ingList">' + an.items.map(ingRow).join("") + "</div>";
+  }
+  async function renderAdd(code, isEdit) {
+    var draft = {};
+    try { draft = JSON.parse(sessionStorage.getItem("bcs-add-draft") || "{}"); } catch (e) { draft = {}; }
+    var existing = code ? await mineLookup(code) : null;
+    if (isEdit && !existing) { main.innerHTML = '<div class="card">That product is not in My products. <a href="#/add">Add it</a> or <a href="#/mine">go back</a>.</div>'; return; }
+    var known = null;
+    if (!existing && code) {
+      try { known = cacheGet(code) || await libLookup(code); } catch (e) { known = cacheGet(code); }
+    }
+    var rec = existing || {};
+    var val = {
+      code: rec.code || code || draft.code || "",
+      name: rec.name || (known && known.name && known.name !== "Unnamed product" ? known.name : "") || draft.name || "",
+      brands: rec.brands || (known && known.brands) || draft.brands || "",
+      cat: rec.cat || (known && known.cat) || draft.cat || "",
+      qty: rec.qty || (known && known.qty) || draft.qty || "",
+      ing: rec.ing || draft.ing || (known && known.ing) || "",
+      img: rec.img || ""
+    };
+    var already = known && !existing;
+    main.innerHTML =
+      "<h1>" + (existing ? "Edit this product" : "Add a product") + "</h1>" +
+      '<p class="lead">Saved only on this device. The app never invents a barcode or an ingredient list — type what is on the package, or photograph it and fix any mistakes.</p>' +
+      (already ? '<div class="note">This barcode is already in the app' + (known.name ? " as “" + esc(known.name) + "”" : "") + ". If you save your own copy, <b>your</b> name and ingredient list will be shown when you scan it.</div>" : "") +
+      '<form class="card" id="addForm">' +
+      '<div class="field"><label for="addCode">Barcode number</label><input id="addCode" inputmode="numeric" autocomplete="off" value="' + esc(val.code) + '" placeholder="The number under the barcode"></div>' +
+      '<div class="row"><button type="button" class="btn ghost" id="addScanBtn">📷 Scan barcode</button></div>' +
+      '<div id="addScanArea" hidden><div class="scan-stage"><video id="scanVideo" playsinline muted autoplay></video><div id="qr-reader" hidden></div>' +
+      '<div class="viewfinder" id="vf"><div class="vf-box"></div></div><div class="scan-msg" id="scanMsg">Point the camera at the barcode</div><div class="scan-read" id="scanRead" aria-live="polite"></div>' +
+      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div></div>' +
+      '<div class="field"><label for="addName">Product name</label><input id="addName" autocomplete="off" required value="' + esc(val.name) + '" placeholder="For example Cool Mint Antiseptic"></div>' +
+      '<div class="field"><label for="addBrand">Brand</label><input id="addBrand" autocomplete="off" value="' + esc(val.brands) + '" placeholder="For example Listerine"></div>' +
+      '<div class="small muted">Product type (helps the rating, for example alcohol in a mouthwash):</div>' + catChips(val.cat, "addChips") +
+      '<div class="field"><label for="addQty">Size (optional)</label><input id="addQty" autocomplete="off" value="' + esc(val.qty) + '" placeholder="For example 16.9 fl oz"></div>' +
+      '<div class="field"><span id="addPhotoLab" style="display:block;font-weight:650;margin-bottom:4px">Front photo (optional)</span>' +
+      '<div class="photo-prev" id="addPhotoPrev">' + (val.img ? '<img src="' + esc(val.img) + '" alt="Front of the product">' : "") + "</div>" +
+      '<div class="row"><label class="btn ghost" for="addPhoto" style="cursor:pointer">📷 Take or choose a photo</label><input id="addPhoto" type="file" accept="image/*" capture="environment" hidden>' +
+      '<button type="button" class="btn ghost small" id="addPhotoClr"' + (val.img ? "" : " hidden") + ">Remove photo</button></div>" +
+      '<p class="small muted">The photo is shrunk and stored on this device only.</p></div>' +
+      '<div class="field"><label for="addIng">Ingredients</label><textarea id="addIng" placeholder="Aqua, Sodium Laureth Sulfate, Glycerin, Parfum…">' + esc(val.ing) + "</textarea></div>" +
+      '<div class="row"><label class="btn ghost" for="addOcr" style="cursor:pointer">📷 Take photo of ingredient label</label><input id="addOcr" type="file" accept="image/*" capture="environment" hidden></div>' +
+      '<div id="addOcrMsg" class="small muted" style="margin-top:8px"></div>' +
+      "</form>" +
+      '<h2>Live rating preview</h2><div id="livePrev"></div>' +
+      '<div class="add-actions"><button type="button" class="btn xl block" id="addSave">' + (existing ? "Save changes" : "Save to this device") + "</button>" +
+      (val.code && !/^m\d+$/.test(val.code) ? '<p class="small" style="margin:10px 0 0"><a target="_blank" rel="noopener" href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(val.code) + '">Also share it to Open Beauty Facts</a> (opens their add-product page; this app does not upload anything).</p>' : '<p class="small muted">If you add a barcode, you can also share the product to Open Beauty Facts after saving.</p>') +
+      (existing ? '<p><button type="button" class="btn danger" id="addDel">Delete from this device</button></p>' : "") +
+      '<p class="small muted"><a href="#/mine">Back to My products</a></p></div>' + disclaimer();
+    var cat = val.cat, photo = val.img || "";
+    wireChips("addChips", function (v) { cat = v; drawPrev(); });
+    function drawPrev() { var box = $("#livePrev"); if (!box) return; box.innerHTML = previewBox($("#addIng").value, cat); animateBars(); }
+    $("#addIng").addEventListener("input", function () { clearTimeout(drawPrev.t); drawPrev.t = setTimeout(drawPrev, 180); });
+    drawPrev();
+    $("#addPhoto").addEventListener("change", async function () {
+      var f = this.files && this.files[0]; if (!f) return;
+      try {
+        photo = await compressPhoto(f, 900, 0.72);
+        $("#addPhotoPrev").innerHTML = '<img src="' + esc(photo) + '" alt="Front of the product">';
+        $("#addPhotoClr").hidden = false;
+      } catch (e) { toast(e.message || "Could not use that photo."); }
+    });
+    $("#addPhotoClr").addEventListener("click", function () { photo = ""; $("#addPhotoPrev").innerHTML = ""; this.hidden = true; $("#addPhoto").value = ""; });
+    $("#addOcr").addEventListener("change", function () { if (this.files && this.files[0]) runOCR(this.files[0], $("#addIng"), $("#addOcrMsg")).then(drawPrev); });
+    $("#addScanBtn").addEventListener("click", function () { $("#addScanArea").hidden = false; beginScanToField($("#addCode")); });
+    $("#addSave").addEventListener("click", async function () {
+      var c = digits($("#addCode").value) || (existing ? existing.code : "");
+      var name = $("#addName").value.trim(), brands = $("#addBrand").value.trim(), qty = $("#addQty").value.trim(), ing = $("#addIng").value.trim();
+      if (name.length < 2) return toast("Enter the product name.");
+      if (ing.length < 3) return toast("Enter the ingredient list from the package.");
+      if (c && c.length < 6 && !/^m\d+$/.test(c)) return toast("That barcode looks too short. Enter the number under the barcode, or leave it blank.");
+      if (!c) c = existing && /^m\d+$/.test(existing.code) ? existing.code : "m" + Date.now();
+      if (c && !/^m\d+$/.test(c) && !checkOK(c)) { if (!confirm("The barcode " + c + " does not have a valid check digit, so it may have been mistyped. Save it anyway?")) return; }
+      var clash = await mineLookup(c);
+      if (clash && (!existing || clash.code !== existing.code)) { toast("You already saved a product with that barcode: “" + clash.name + "”. Open it to edit."); return; }
+      if (existing && existing.code !== c) await mineDel(existing.code);
+      try {
+        await minePut({ code: c, name: name, brands: brands, qty: qty, cat: cat, ing: ing, img: photo, added: existing && existing.added });
+        try { sessionStorage.removeItem("bcs-add-draft"); } catch (e) {}
+        toast(existing ? "Saved changes" : "Saved on this device");
+        location.hash = "#/product/" + encodeURIComponent(c);
+      } catch (e) { toast(e.message || "Could not save."); }
+    });
+    var del = $("#addDel");
+    if (del) del.addEventListener("click", async function () {
+      if (!confirm("Remove “" + val.name + "” from this device? This cannot be undone unless you have a backup file.")) return;
+      await mineDel(existing.code); toast("Removed from this device"); location.hash = "#/mine";
+    });
+  }
+  async function beginScanToField(input) {
+    var area = $("#addScanArea"), video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"), zoom = $("#zoomBtn"), msg = $("#scanMsg"), read = $("#scanRead");
+    if (!area) return;
+    area.hidden = false; await stopScan();
+    torch.hidden = true; zoom.hidden = true; read.textContent = ""; msg.textContent = "Starting the camera…";
+    var done = false, timers = [], sess = ++scanSession;
+    function clear() { timers.forEach(clearTimeout); timers = []; }
+    function onCode(raw) {
+      if (done || sess !== scanSession) return;
+      var d = digits(raw); if (!d || d.length < 6) return;
+      if (!checkOK(d)) { read.textContent = "Read " + d + " but it does not look right. Hold steady and try again."; return; }
+      done = true; clear(); input.value = d; read.textContent = "Scanned " + d + " ✔"; beep(); stopScan();
+      setTimeout(function () { area.hidden = true; }, 400);
+    }
+    function wireExtras() {
+      try {
+        var stream = (scanCtl && scanCtl.stream) || video.srcObject || (zx.querySelector("video") || {}).srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
+        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
+        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) { zoom.hidden = false; var z2 = false; zoom.onclick = function () { z2 = !z2; var v = z2 ? Math.min(caps.zoom.max, Math.max(caps.zoom.min * 2, 2)) : caps.zoom.min; track.applyConstraints({ advanced: [{ zoom: v }] }).catch(function () {}); zoom.textContent = z2 ? "Zoom out" : "Zoom"; }; }
+      } catch (e) {}
+    }
+    async function useZxing() { video.hidden = true; vf.hidden = true; zx.hidden = false; msg.textContent = "Point the camera at the barcode"; scanCtl = await startZxing("qr-reader", onCode); wireExtras(); }
+    try {
+      if (!window.isSecureContext) throw new Error("Camera needs HTTPS.");
+      var native = false;
+      if (typeof window.BarcodeDetector === "function") {
+        try { video.hidden = false; zx.hidden = true; vf.hidden = false; scanCtl = await startNative(video, onCode); native = true; } catch (e) { if (e && /NotAllowed|Permission|denied|NotFound|Requested device/i.test(e.name + " " + e.message)) throw e; }
+      }
+      if (native) {
+        msg.textContent = "Point the camera at the barcode"; wireExtras();
+        timers.push(setTimeout(async function () {
+          if (done || sess !== scanSession) return;
+          msg.textContent = "Trying a second scanner…"; try { await scanCtl.stop(); } catch (e) {} scanCtl = null;
+          try { await useZxing(); } catch (e) { area.hidden = true; toast((e && e.message) || "The camera could not start."); }
+        }, 4000));
+      } else { await useZxing(); }
+    } catch (err) { area.hidden = true; toast((err && err.message) || "The camera could not start."); }
+    var st = $("#stopScan"); if (st) st.onclick = function () { stopScan(); area.hidden = true; };
+  }
+  async function renderMine() {
+    var list = await mineAll();
+    list = list.slice().sort(function (a, b) { return (b.updated || 0) - (a.updated || 0); });
+    main.innerHTML = '<h1>My products</h1><p class="lead">Products you added on this device. They are checked first when you scan, and they show up in name search and best-rated lists, tagged “Added by you.” Nothing here is sent off this phone.</p>' +
+      '<a class="btn xl block" href="#/add">➕  Add a product</a>' +
+      (list.length ? '<div class="list" style="margin-top:16px">' + list.map(function (r) {
+        var p = mineProduct(r), an = p.ing ? B.analyze(p.ing, p.cat) : { verdict: null, endoDirect: [] };
+        var q = { code: p.code, name: p.name, brands: p.brands, img: p.img, mine: true, score: an.enough ? an.score : null };
+        return listRow(q, an, "#/product/" + encodeURIComponent(p.code));
+      }).join("") + "</div>" : '<div class="card"><p>You have not added a product yet. If a scan comes back empty, add the barcode and the ingredient list from the package.</p></div>') +
+      '<div class="card"><h3>Backup</h3><p class="small muted">Download a file of your products (including photos) so you can bring them back later, for example on a new phone. The file stays in your downloads until you choose to import it. It does not include your scan history or favorites.</p>' +
+      '<div class="row"><button type="button" class="btn" id="expBtn">⬇️ Export backup file</button>' +
+      '<label class="btn ghost" for="impFile" style="cursor:pointer">⬆️ Import backup file</label><input id="impFile" type="file" accept="application/json,.json" hidden></div>' +
+      '<div id="impMsg" class="small muted" style="margin-top:8px"></div></div>' + disclaimer();
+    $("#expBtn").addEventListener("click", function () { exportMine(list); });
+    $("#impFile").addEventListener("change", function () { if (this.files && this.files[0]) importMine(this.files[0], $("#impMsg")); });
+  }
+  function exportMine(list) {
+    var data = { app: "Body Care Scanner", kind: "my-products", version: VERSION, exported: new Date().toISOString(), products: list.map(function (r) { return { code: r.code, name: r.name, brands: r.brands || "", qty: r.qty || "", cat: r.cat || "", ing: r.ing || "", img: r.img || "", added: r.added, updated: r.updated }; }) };
+    var blob = new Blob([JSON.stringify(data)], { type: "application/json" }), a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = "body-care-scanner-my-products.json"; a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+    toast("Backup file downloaded");
+  }
+  async function importMine(file, msg) {
+    msg.textContent = "Reading the file…";
+    try {
+      var data = JSON.parse(await file.text()), rows = (data && data.products) || (Array.isArray(data) ? data : null);
+      if (!rows) throw new Error("This file is not a Body Care Scanner backup.");
+      var ok = 0, skip = 0;
+      for (var i = 0; i < rows.length; i++) {
+        var r = rows[i];
+        if (!r || !r.name || !(r.ing || "").trim()) { skip++; continue; }
+        var c = String(r.code || ("m" + Date.now() + i));
+        await minePut({ code: c, name: String(r.name), brands: r.brands || "", qty: r.qty || "", cat: r.cat || "", ing: String(r.ing), img: r.img || "", added: r.added, updated: r.updated });
+        ok++;
+      }
+      msg.innerHTML = "✔ Imported " + ok + " product" + (ok === 1 ? "" : "s") + (skip ? ". Skipped " + skip + " incomplete " + (skip === 1 ? "row" : "rows") + "." : ".");
+      toast("Imported " + ok + " product" + (ok === 1 ? "" : "s"));
+      setTimeout(function () { renderMine(); }, 600);
+    } catch (e) { msg.innerHTML = '<span style="color:var(--bad)">' + esc(e.message || "Could not import that file.") + "</span>"; }
+  }
+
 
   window.BCS_APP = { route: route, version: VERSION };
   route();

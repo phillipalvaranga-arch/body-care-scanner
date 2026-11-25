@@ -1,4 +1,4 @@
-const C = 'bodycare-v4';
+const C = 'bodycare-v5';
 const F = [
   './', 'index.html', 'style.css', 'js/app.js', 'js/analyze.js', 'js/db.js',
   'vendor/html5-qrcode.min.js', 'data/us-products.json', 'manifest.webmanifest',
