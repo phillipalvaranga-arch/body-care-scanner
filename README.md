@@ -35,3 +35,14 @@ The "US products only" switch (on by default) limits Open Beauty Facts searches,
 ## Add a product (v5)
 
 If a barcode is not in the app, you can add it yourself: name, brand, type, optional size and front photo, and the ingredient list (typed, pasted, or read from a photo on the device). The live preview shows the GOOD / OK / BAD rating before you save. Products are stored only on this device (IndexedDB, with compressed photos), are checked first on future scans, and appear in name search and best-rated lists with an “Added by you” tag. Edit, delete, and export or import a backup JSON file from the My products tab. Sharing to Open Beauty Facts is optional and opens their add-product page — the app never uploads for you.
+
+## v6: scanning that never fails silently
+
+- **Misreads stopped.** A blurry webcam could read a barcode as a different number that still passes the check digit, so you landed on "not found". Every live read is now double-checked on a sharpened, enlarged copy of the same picture; if that copy cannot be read, three matching reads are needed.
+- **Any camera works.** The app only *prefers* the back camera. PCs with just a front webcam fall back to any camera, and finally to a camera picked from the device list.
+- **Windows Edge and Chrome** have no built-in barcode reader, so the ZXing scanner starts at once. Its "try harder" mode is on, the read area is bigger, and a once-a-second booster reads an enhanced copy of the picture.
+- **Visible fallbacks.** If nothing is read in 8 seconds, or the camera cannot start, a big **Type the barcode number** box and a **Take a photo of the barcode** button appear. The home page also has **Use a photo of the barcode instead**. Photos are read with several cleaned-up copies (whole, sharpened, middle enlarged, turned sideways).
+- **Clear messages.** There are separate messages for blocked permission (with Edge/Chrome and Windows privacy steps), no camera, a camera in use by another app, and pages shown inside another page.
+- **No silent "no result".** The lookup screen shows **Scanned: number**. Every result shows the barcode and where it was found. The not-found page shows the number with a box to fix it, and lists every place checked: your products, the US library, Open Beauty Facts, Open Products Facts and Open Food Facts. Each one shows found, not there, or did not answer.
+- **Updates arrive.** The service worker is `bodycare-v6` and always asks the server for fresh files, bypassing the 10-minute browser cache. Files are versioned (`?v=6`). An open tab shows **Update available - tap to refresh** when a newer version is ready. The home page shows the app version and US library size.
+- **The on-device database can't hang a lookup.** It times out after 3 seconds and uses the backup copy.

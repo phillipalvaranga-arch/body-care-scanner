@@ -10,7 +10,7 @@
   ];
   var FIELDS = "code,product_name,product_name_en,brands,quantity,ingredients_text,ingredients_text_en,image_front_small_url,categories_tags,countries_tags";
   var KEYS = { hist: "bcs-history", fav: "bcs-favorites", theme: "bcs-theme", cache: "bcs-cache", over: "bcs-over", hormOnly: "bcs-horm-only", usOnly: "bcs-us-only" };
-  var VERSION = "bodycare-v5";
+  var VERSION = "bodycare-v6";
   var main = document.getElementById("main");
   var toastEl = document.getElementById("toast");
   var themeBtn = document.getElementById("themeBtn");
@@ -31,7 +31,41 @@
   setNet(navigator.onLine);
   window.addEventListener("online", function () { setNet(true); });
   window.addEventListener("offline", function () { setNet(false); });
-  if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").catch(function () {});
+  /* Service worker: check for a new version on every open, and show a banner when one is ready. */
+  var swReg = null;
+  function showUpdateBanner() {
+    if ($("#updBar")) return;
+    var b = document.createElement("button"); b.type = "button"; b.id = "updBar"; b.className = "upd-bar";
+    b.textContent = "Update available - tap to refresh";
+    b.addEventListener("click", function () {
+      b.textContent = "Updating…";
+      try { if (swReg && swReg.waiting) swReg.waiting.postMessage({ type: "SKIP_WAITING" }); } catch (e) {}
+      setTimeout(function () { location.reload(); }, 300);
+    });
+    document.body.appendChild(b);
+  }
+  function askSwVersion(sw) {
+    return new Promise(function (res) {
+      if (!sw) return res(null);
+      var ch = new MessageChannel(), t = setTimeout(function () { res(null); }, 2000);
+      ch.port1.onmessage = function (e) { clearTimeout(t); res(e.data && e.data.version); };
+      try { sw.postMessage({ type: "VERSION" }, [ch.port2]); } catch (e) { clearTimeout(t); res(null); }
+    });
+  }
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("./sw.js", { updateViaCache: "none" }).then(function (reg) {
+      swReg = reg;
+      function watch(w) { if (w) w.addEventListener("statechange", function () { if (w.state === "installed" && navigator.serviceWorker.controller) showUpdateBanner(); }); }
+      if (reg.waiting && navigator.serviceWorker.controller) showUpdateBanner();
+      reg.addEventListener("updatefound", function () { watch(reg.installing); });
+      document.addEventListener("visibilitychange", function () { if (!document.hidden) reg.update().catch(function () {}); });
+    }).catch(function () {});
+    /* A new worker took over. If it belongs to a newer app than the code running on this page, offer a refresh. */
+    navigator.serviceWorker.addEventListener("controllerchange", function () {
+      askSwVersion(navigator.serviceWorker.controller).then(function (v) { if (v && v !== VERSION) showUpdateBanner(); });
+    });
+    askSwVersion(navigator.serviceWorker.controller).then(function (v) { if (v && v !== VERSION) showUpdateBanner(); });
+  }
 
   var VICON = { low: "✔", mod: "!", high: "✖" };
   var VERDICT_ICON = { GOOD: "✔", OK: "!", BAD: "✖" };
@@ -69,6 +103,9 @@
       r.onupgradeneeded = function () { r.result.createObjectStore("products", { keyPath: "code" }); };
       r.onsuccess = function () { res(r.result); };
       r.onerror = function () { idbP = null; rej(r.error); };
+      r.onblocked = function () { idbP = null; rej(new Error("idb-blocked")); };
+      /* Never let a stuck database hold up a lookup: give up after 3 seconds and use the backup copy. */
+      setTimeout(function () { idbP = null; rej(new Error("idb-timeout")); }, 3000);
     });
     return idbP;
   }
@@ -214,7 +251,7 @@
   }
   /* Look the barcode up in three free sister databases (same API), trying UPC-A and EAN-13 forms.
      Open Beauty Facts first; the other two only when it has no ingredient list. A failed request is retried once. */
-  var lookupIssues = [];
+  var lookupIssues = [], lookupLog = [];
   function askSource(src, c, retry) {
     return getJSON(src.host + "/api/v2/product/" + encodeURIComponent(c) + ".json?fields=" + FIELDS, 14000).then(function (d) {
       if (d && d.status === 1 && d.product) { d.product.code = d.product.code || d.code || c; return { src: src, p: norm(d.product, src) }; }
@@ -227,15 +264,22 @@
   async function lookup(raw) {
     var list = candidates(raw);
     if (!list.length) throw new Error("Enter a barcode number.");
-    lookupIssues = [];
+    lookupIssues = []; lookupLog = [];
     var fromMine = await mineLookup(raw);
+    lookupLog.push({ n: "Your products on this device", s: fromMine ? "found" : "no" });
     if (fromMine) return fromMine;
     var fromLib = await libLookup(raw);
+    lookupLog.push({ n: "Built-in US library" + (LIB ? " (" + LIB.d.rows.length.toLocaleString() + " products)" : ""), s: fromLib ? "found" : (LIB_ERR ? "err" : "no"), e: LIB_ERR });
     if (fromLib) return fromLib;
     var all = [];
     async function stage(srcs) {
       var res = await Promise.all([].concat.apply([], srcs.map(function (src) { return list.map(function (c) { return askSource(src, c, true); }); })));
       res.forEach(function (r) { if (r.err && lookupIssues.indexOf(r.src.name) < 0) lookupIssues.push(r.src.name); });
+      srcs.forEach(function (src) {
+        var mineR = res.filter(function (r) { return r.src === src; });
+        var st = mineR.some(function (r) { return r.p && r.p.ing; }) ? "found" : mineR.some(function (r) { return r.p; }) ? "noing" : mineR.every(function (r) { return r.err; }) ? "err" : "no";
+        lookupLog.push({ n: src.name, s: st });
+      });
       all = all.concat(res);
       return res.filter(function (r) { return r.p && r.p.ing; });
     }
@@ -274,12 +318,13 @@
   }
   /* ---------- built-in US product library (data/us-products.json) ---------- */
   var LIB = null, LIBP = null;
+  var LIB_ERR = "";
   function loadLib() {
     if (LIB) return Promise.resolve(LIB);
-    if (!LIBP) LIBP = fetch("data/us-products.json").then(function (r) { if (!r.ok) throw new Error("US library " + r.status); return r.json(); }).then(function (d) {
+    if (!LIBP) LIBP = fetch("data/us-products.json?v=6").then(function (r) { if (!r.ok) throw new Error("US library " + r.status); return r.json(); }).then(function (d) {
       var by = {}; d.rows.forEach(function (r) { by[r[0]] = r; });
-      LIB = { d: d, by: by, tok: null }; return LIB;
-    }).catch(function (e) { LIBP = null; throw e; });
+      LIB = { d: d, by: by, tok: null }; LIB_ERR = ""; return LIB;
+    }).catch(function (e) { LIBP = null; LIB_ERR = (e && e.message) || "could not load"; throw e; });
     return LIBP;
   }
   function libProduct(r, d) {
@@ -347,12 +392,33 @@
 
   /* ---------- camera ---------- */
   var FORMATS = ["ean_13", "ean_8", "upc_a", "upc_e", "code_128", "code_39", "itf", "codabar"];
-  var STREAM = { audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } } };
-  async function startNative(video, onCode) {
-    var fmts = FORMATS;
-    try { var sup = await BarcodeDetector.getSupportedFormats(); fmts = FORMATS.filter(function (f) { return sup.indexOf(f) >= 0; }); } catch (e) {}
-    if (!fmts.some(function (f) { return /ean|upc/.test(f); })) throw new Error("No native barcode formats");
-    var stream = await navigator.mediaDevices.getUserMedia(STREAM);
+  /* html5-qrcode reports camera errors as plain text, the browser as Error objects: read both. */
+  function errText(e) { return typeof e === "string" ? e : ((e && e.name) || "") + " " + ((e && e.message) || "") + " " + (e ? String(e) : ""); }
+  function isDenied(e) { return /NotAllowed|Permission|denied|SecurityError/i.test(errText(e)); }
+  /* Camera requests, best first. PCs usually have only a front webcam, so every request only *prefers* the back
+     camera ("ideal"), and the last one takes any camera at all. */
+  var CAM_TRIES = [
+    { facingMode: { ideal: "environment" }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+    { facingMode: { ideal: "environment" } },
+    null
+  ];
+  async function nativeFormats() {
+    if (typeof window.BarcodeDetector !== "function") return null;
+    try {
+      var sup = await BarcodeDetector.getSupportedFormats(), f = FORMATS.filter(function (x) { return sup.indexOf(x) >= 0; });
+      return f.some(function (x) { return /ean|upc/.test(x); }) ? f : null;
+    } catch (e) { return null; }
+  }
+  async function openStream() {
+    var last;
+    for (var i = 0; i < CAM_TRIES.length; i++) {
+      try { return await navigator.mediaDevices.getUserMedia({ audio: false, video: CAM_TRIES[i] || true }); }
+      catch (e) { last = e; if (isDenied(e)) throw e; }
+    }
+    throw last;
+  }
+  async function startNative(video, onCode, fmts) {
+    var stream = await openStream();
     video.srcObject = stream; video.setAttribute("playsinline", "true"); video.muted = true; await video.play();
     try { var tr = stream.getVideoTracks()[0], caps = tr.getCapabilities && tr.getCapabilities(); if (caps && caps.focusMode && caps.focusMode.indexOf("continuous") >= 0) await tr.applyConstraints({ advanced: [{ focusMode: "continuous" }] }); } catch (e) {}
     var det = new BarcodeDetector({ formats: fmts }), stopped = false, last = 0;
@@ -368,23 +434,187 @@
     })(0);
     return { stop: function () { stopped = true; stream.getTracks().forEach(function (t) { t.stop(); }); video.srcObject = null; }, stream: stream };
   }
+  function zxFormats() { var F = Html5QrcodeSupportedFormats; return [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF]; }
+  /* ZXing (html5-qrcode) live scanner. Used right away when the browser has no built-in barcode reader
+     (Edge and Chrome on Windows, Firefox, iPhone). */
   async function startZxing(id, onCode) {
-    if (typeof Html5Qrcode === "undefined") throw new Error("Scanner library failed to load.");
-    var h = new Html5Qrcode(id, { verbose: false, experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
-    var F = Html5QrcodeSupportedFormats, w = Math.min(340, Math.floor((document.documentElement.clientWidth || 360) * 0.82));
-    await h.start({ facingMode: "environment" }, { fps: 10, qrbox: { width: w, height: Math.round(w * 0.5) }, videoConstraints: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }, formatsToSupport: [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.CODE_39, F.ITF] }, function (t) { onCode(t); }, function () {});
-    return { stop: function () { return h.stop().then(function () { h.clear(); }).catch(function () {}); }, stream: null };
+    if (typeof Html5Qrcode === "undefined") throw new Error("The scanner add-on did not load. Refresh the page.");
+    var h = new Html5Qrcode(id, { verbose: false, formatsToSupport: zxFormats(), experimentalFeatures: { useBarCodeDetectorIfSupported: true } });
+    var cfg = { fps: 12, qrbox: function (w, hh) { return { width: Math.max(60, Math.floor(w * 0.92)), height: Math.max(60, Math.floor(hh * 0.62)) }; } };
+    var last, ok = false;
+    for (var i = 0; i < CAM_TRIES.length && !ok; i++) {
+      if (!CAM_TRIES[i]) break;
+      try { await h.start({ facingMode: "environment" }, Object.assign({}, cfg, { videoConstraints: CAM_TRIES[i] }), function (t) { onCode(t); }, function () {}); ok = true; }
+      catch (e) { last = e; if (isDenied(e)) throw e; try { await h.stop(); } catch (e2) {} }
+    }
+    if (!ok) {
+      /* Last try: list the cameras and open one by its id (a back camera if there is one, otherwise the first). */
+      var cams = [];
+      try { cams = await Html5Qrcode.getCameras(); } catch (e) { if (isDenied(e)) throw e; last = last || e; }
+      if (!cams.length) throw last || new Error("NotFoundError: no camera found");
+      var pick = cams.filter(function (c) { return /back|rear|environment/i.test(c.label || ""); })[0] || cams[0];
+      await h.start(pick.id, cfg, function (t) { onCode(t); }, function () {});
+    }
+    /* Booster: once a second, also read a sharpened, enlarged copy of the middle of the picture.
+       Blurry webcams and phone cameras that cannot focus close are read far more often this way. */
+    var stopped = false, busy = false, el = document.getElementById(id);
+    var boost = setInterval(function () {
+      if (stopped || busy) return;
+      var v = el && el.querySelector("video"); if (!v || v.readyState < 2 || !v.videoWidth) return;
+      busy = true;
+      frameVariantDecode(v).then(function (t) { if (t && !stopped) onCode(t, "boost"); }).catch(function () {}).then(function () { busy = false; });
+    }, 1000);
+    return { stop: function () { stopped = true; clearInterval(boost); return h.stop().then(function () { h.clear(); }).catch(function () {}); }, stream: null };
   }
-  async function stopScan() { scanSession++; if (scanCtl) { try { await scanCtl.stop(); } catch (e) {} scanCtl = null; } }
+  async function stopScan() { scanSession++; if (scanCtl) { var c = scanCtl; scanCtl = null; try { await c.stop(); } catch (e) {} } }
   function beep() { try { if (navigator.vibrate) navigator.vibrate(80); var c = new (window.AudioContext || window.webkitAudioContext)(), o = c.createOscillator(), g = c.createGain(); o.frequency.value = 880; g.gain.value = 0.06; o.connect(g); g.connect(c.destination); o.start(); setTimeout(function () { o.stop(); c.close(); }, 120); } catch (e) {} }
+
+  /* ---------- reading a barcode from a still picture ---------- */
+  function photoHost() { var d = document.getElementById("bcsPhotoHost"); if (!d) { d = document.createElement("div"); d.id = "bcsPhotoHost"; d.style.display = "none"; document.body.appendChild(d); } return d.id; }
+  function drawVariant(src, W, H, v) {
+    var sx = W * v[0], sy = H * v[1], sw = W * v[2], sh = H * v[3], sc = v[4], rot = v[5], w = Math.max(1, Math.round(sw * sc)), hh = Math.max(1, Math.round(sh * sc));
+    var c = document.createElement("canvas"); c.width = rot ? hh : w; c.height = rot ? w : hh;
+    var x = c.getContext("2d"); if (v[6]) x.filter = "grayscale(1) contrast(1.8)";
+    if (rot) { x.translate(hh, 0); x.rotate(Math.PI / 2); }
+    x.drawImage(src, sx, sy, sw, sh, 0, 0, w, hh); return c;
+  }
+  function canvasFile(c, type) { return new Promise(function (res) { c.toBlob(function (b) { res(b ? new File([b], "frame", { type: type }) : null); }, type, 0.92); }); }
+  async function zxFile(file) {
+    if (!file || typeof Html5Qrcode === "undefined") return null;
+    try { var h = new Html5Qrcode(photoHost(), { verbose: false, formatsToSupport: zxFormats() }); var t = await h.scanFile(file, false); try { h.clear(); } catch (e) {} return t; } catch (e) { return null; }
+  }
+  async function decodeVariants(src, W, H, list, type) {
+    for (var i = 0; i < list.length; i++) {
+      var t = await zxFile(await canvasFile(drawVariant(src, W, H, list[i]), type));
+      if (t && checkOK(digits(t))) return t;
+    }
+    return null;
+  }
+  async function frameVariantDecode(video) {
+    var W = video.videoWidth, H = video.videoHeight, m = Math.max(W, H);
+    return decodeVariants(video, W, H, [[0.12, 0.2, 0.76, 0.6, Math.min(2, 1400 / (m * 0.76)), 0, 1], [0.12, 0.2, 0.76, 0.6, 1, 0, 1]], "image/jpeg");
+  }
+  /* Photo of a barcode: try the built-in reader, then ZXing on several cleaned-up copies
+     (whole picture, sharpened, middle enlarged, smaller, turned sideways). */
+  async function decodePhoto(file) {
+    var img;
+    try { img = await createImageBitmap(file); } catch (e) {
+      img = await new Promise(function (res, rej) { var i = new Image(); i.onload = function () { res(i); }; i.onerror = function () { rej(new Error("That file is not a picture this browser can open.")); }; i.src = URL.createObjectURL(file); });
+    }
+    var W = img.width || img.naturalWidth, H = img.height || img.naturalHeight, m = Math.max(W, H), base = Math.min(1, 1600 / m);
+    var fm = await nativeFormats();
+    if (fm) { try { var r = await new BarcodeDetector({ formats: fm }).detect(img); var ok = (r || []).filter(function (x) { return checkOK(digits(x.rawValue)); })[0]; if (ok) return ok.rawValue; } catch (e) {} }
+    return decodeVariants(img, W, H, [
+      [0, 0, 1, 1, base, 0, 0], [0, 0, 1, 1, base, 0, 1], [0.15, 0.2, 0.7, 0.6, Math.min(2, 1600 / (m * 0.7)), 0, 1],
+      [0, 0, 1, 1, Math.min(1, 800 / m), 0, 1], [0.25, 0.3, 0.5, 0.4, Math.min(2.5, 1600 / (m * 0.5)), 0, 1], [0, 0, 1, 1, base, 1, 1]
+    ], "image/png");
+  }
+
+  /* ---------- the "type it or take a photo" box ---------- */
+  function rescueHTML(px, title) {
+    return '<div class="rescue" id="' + px + 'Box">' + (title ? "<p class=\"rescue-title\">" + title + "</p>" : "") +
+      '<label for="' + px + 'Type" class="rescue-lbl">Type the barcode number</label>' +
+      '<div class="rescue-row"><input id="' + px + 'Type" class="big-code" inputmode="numeric" autocomplete="off" enterkeyhint="search" placeholder="Numbers under the barcode"><button type="button" class="btn" id="' + px + 'Go">Look up</button></div>' +
+      '<label class="btn ghost block photo-btn" for="' + px + 'Photo">📷  Take a photo of the barcode</label><input type="file" accept="image/*" capture="environment" id="' + px + 'Photo" class="visually-hidden">' +
+      '<div class="small muted rescue-msg" id="' + px + 'Msg" aria-live="polite"></div></div>';
+  }
+  function wireRescue(px, onCode) {
+    var inp = $("#" + px + "Type"), go = $("#" + px + "Go"), ph = $("#" + px + "Photo"), msg = $("#" + px + "Msg");
+    if (!inp) return;
+    function submit() {
+      var d = digits(inp.value);
+      if (d.length < 6) { msg.textContent = "Type all the numbers under the barcode (usually 12 or 13)."; inp.focus(); return; }
+      onCode(d);
+    }
+    go.addEventListener("click", submit);
+    inp.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); submit(); } });
+    ph.addEventListener("change", async function () {
+      var f = ph.files && ph.files[0]; ph.value = ""; if (!f) return;
+      msg.innerHTML = '<span class="spin"></span>Reading the barcode in your photo…';
+      try {
+        var t = await decodePhoto(f), d = digits(t);
+        if (d && checkOK(d)) { msg.textContent = "Read " + d + " from the photo ✔"; onCode(d); }
+        else msg.innerHTML = "<b>No barcode could be read in that photo.</b> Take it again closer, so the barcode fills most of the picture, keep it flat, sharp and well lit, or type the number above.";
+      } catch (e) { msg.textContent = (e && e.message) || "That photo could not be read."; }
+    });
+  }
   function cameraHelp(err) {
-    var n = (err && (err.name || err.message)) || "";
-    var h = '<div class="note"><b>The camera could not start.</b>';
-    if (!window.isSecureContext) h += "<p>The camera only works on a secure (https) page. Open the live app address.</p>";
-    else if (/NotAllowed|Permission|denied/i.test(n)) h += "<p>Camera permission is blocked. In Chrome, tap the lock icon in the address bar, set Camera to Allow, then tap Scan again. You can also type the barcode or search by name.</p>";
-    else if (/NotFound|DevicesNotFound|Requested device/i.test(n)) h += "<p>No camera was found on this device. Type the barcode or search by name instead.</p>";
-    else h += "<p>" + esc(err && err.message ? err.message : "Unknown camera error") + ". You can type the barcode or search by name instead.</p>";
-    return h + "</div>";
+    var n = errText(err);
+    var h = '<div class="note cam-fail"><b>The camera could not start.</b>';
+    if (!window.isSecureContext) h += "<p>The camera only works on a secure (https) page. Open the live app address: phillipalvaranga-arch.github.io/body-care-scanner</p>";
+    else if (/NotAllowed|Permission|denied|SecurityError/i.test(n)) {
+      h += "<p>Camera permission is blocked for this site.</p><ul class=\"small\"><li><b>Edge or Chrome on a computer:</b> click the camera or lock icon at the left of the address bar, set Camera to <b>Allow</b>, then reload. In Windows, also check Settings → Privacy &amp; security → Camera → let desktop apps and your browser use the camera.</li><li><b>Phone:</b> tap the lock icon next to the address, set Camera to Allow, then tap Scan again.</li></ul>";
+      if (window.top !== window.self) h += '<p>This page is shown inside another page, which can block the camera. <a href="' + esc(location.href) + '" target="_blank" rel="noopener">Open the app in its own tab</a>.</p>';
+    }
+    else if (/NotFound|DevicesNotFound|Requested device|no camera/i.test(n)) h += "<p>No camera was found. On a computer without a webcam, take a photo of the barcode with your phone and open it here, or type the number.</p>";
+    else if (/NotReadable|TrackStart|Could not start|in use/i.test(n)) h += "<p>Another app is using the camera (for example Teams, Zoom, Skype or the Camera app). Close it, then tap Scan again.</p>";
+    else h += "<p>" + esc((typeof err === "string" ? err : err && err.message) || "Unknown camera error") + "</p>";
+    return h + "<p>You can still look the product up: type the number or take a photo of the barcode below.</p></div>";
+  }
+  /* Shared scanner. Blurry webcams can misread a barcode as a different number that still passes the check digit,
+     so a live read is double-checked on a sharpened, enlarged copy of the same picture before it is used.
+     If that copy cannot be read, three matching live reads (and a clear lead over any other number) are needed. */
+  async function runScanner(o) {
+    var area = o.area, video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"), zoom = $("#zoomBtn"), msg = $("#scanMsg"), read = $("#scanRead"), rescue = $("#scanRescue");
+    if (o.help) o.help.innerHTML = "";
+    area.hidden = false; await stopScan();
+    torch.hidden = true; zoom.hidden = true; read.textContent = ""; if (rescue) rescue.hidden = true; msg.textContent = "Starting the camera…";
+    var done = false, timers = [], mine = ++scanSession, seen = {}, verifying = false, verifyMissed = 0;
+    function clear() { timers.forEach(clearTimeout); timers = []; }
+    function accept(d) { done = true; clear(); read.textContent = "Scanned " + d + " ✔"; beep(); stopScan(); o.onAccept(d); }
+    function liveVideo() { return !video.hidden && video.srcObject ? video : zx.querySelector("video"); }
+    function verify() {
+      var v = liveVideo(); if (verifying || !v || v.readyState < 2 || !v.videoWidth) return;
+      verifying = true;
+      frameVariantDecode(v).then(function (t) { verifying = false; if (t) onCode(t, "boost"); else { verifyMissed++; recheck(); } }, function () { verifying = false; verifyMissed++; recheck(); });
+    }
+    function leader() { var best = null, b = 0, r = 0; Object.keys(seen).forEach(function (k) { if (seen[k] > b) { r = b; b = seen[k]; best = k; } else if (seen[k] > r) r = seen[k]; }); return { d: best, n: b, rival: r }; }
+    function recheck() { if (done || mine !== scanSession || verifying) return; var L = leader(); if (L.d && verifyMissed > 0 && L.n >= 3 && L.n >= L.rival + 3) accept(L.d); }
+    function onCode(raw, src) {
+      if (done || mine !== scanSession) return;
+      var d = digits(raw); if (!d || d.length < 6) return;
+      if (!checkOK(d)) { read.textContent = "Read " + d + " but it does not look right. Hold steady…"; return; }
+      if (src === "boost") return accept(d); /* the sharpened copy is the most reliable read */
+      seen[d] = (seen[d] || 0) + 1;
+      read.textContent = "Reading " + d + "… hold still";
+      if (verifying) return;
+      if (verifyMissed > 0) { recheck(); if (done) return; }
+      verify();
+    }
+    function wireExtras() {
+      try {
+        var stream = (scanCtl && scanCtl.stream) || video.srcObject || (zx.querySelector("video") || {}).srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
+        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
+        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) { zoom.hidden = false; var z2 = false; zoom.onclick = function () { z2 = !z2; var v = z2 ? Math.min(caps.zoom.max, Math.max(caps.zoom.min * 2, 2)) : caps.zoom.min; track.applyConstraints({ advanced: [{ zoom: v }] }).catch(function () {}); zoom.textContent = z2 ? "Zoom out" : "Zoom"; }; }
+      } catch (e) {}
+    }
+    async function useZxing() {
+      video.hidden = true; vf.hidden = true; zx.hidden = false; msg.textContent = "Point the camera at the barcode";
+      var c = await startZxing("qr-reader", onCode);
+      if (mine !== scanSession) { c.stop(); return; }
+      scanCtl = c; wireExtras();
+    }
+    function fail(err) { clear(); if (mine === scanSession) stopScan(); area.hidden = true; o.onFail(err); }
+    try {
+      if (!window.isSecureContext) throw new Error("Camera needs HTTPS.");
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This browser cannot open the camera.");
+      var fm = await nativeFormats(), native = false;
+      if (fm) {
+        try { video.hidden = false; zx.hidden = true; vf.hidden = false; var c0 = await startNative(video, onCode, fm); if (mine !== scanSession) { c0.stop(); return; } scanCtl = c0; native = true; }
+        catch (e) { if (isDenied(e)) throw e; }
+      }
+      if (mine !== scanSession) return;
+      if (native) {
+        msg.textContent = "Point the camera at the barcode"; wireExtras();
+        timers.push(setTimeout(async function () {
+          if (done || mine !== scanSession) return;
+          msg.textContent = "Trying a second scanner…"; var c1 = scanCtl; scanCtl = null; try { await c1.stop(); } catch (e) {}
+          try { await useZxing(); } catch (e) { fail(e); }
+        }, 4000));
+      } else { await useZxing(); }
+      timers.push(setTimeout(function () { if (!done && mine === scanSession) msg.textContent = "Hold the barcode 4 to 8 inches away, flat and well lit. Tap Light if it is dark."; }, 5000));
+      timers.push(setTimeout(function () { if (!done && mine === scanSession) { msg.textContent = "Not reading? Type the number or take a photo below."; if (rescue) rescue.hidden = false; } }, 8000));
+    } catch (err) { fail(err); }
   }
 
   /* ---------- routing ---------- */
@@ -498,10 +728,11 @@
     main.innerHTML =
       '<div class="hero"><h1>What is really in your body-care products?</h1>' +
       '<p class="lead">Scan toothpaste, mouthwash, shampoo, conditioner, soap, body wash, deodorant or lotion. Every ingredient is explained in plain English and rated <b>Good for you</b>, <b>OK</b> or <b>Bad for you</b>, with hormone-disruptor flags and sources.</p>' +
-      '<button type="button" class="btn xl block" id="startScan">📷  Scan barcode</button></div>' +
+      '<button type="button" class="btn xl block" id="startScan">📷  Scan barcode</button>' +
+      '<label class="btn ghost block photo-home" for="homePhoto">🖼️  Use a photo of the barcode instead</label><input type="file" accept="image/*" id="homePhoto" class="visually-hidden"><div class="small muted" id="homePhotoMsg" aria-live="polite"></div></div>' +
       '<div id="scanArea" hidden><div class="scan-stage"><video id="scanVideo" playsinline muted autoplay></video><div id="qr-reader" hidden></div>' +
       '<div class="viewfinder" id="vf"><div class="vf-box"></div></div><div class="scan-msg" id="scanMsg">Point the camera at the barcode</div><div class="scan-read" id="scanRead" aria-live="polite"></div>' +
-      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div></div>' +
+      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div><div id="scanRescue" hidden>' + rescueHTML("sr", "") + '</div></div>' +
       '<div id="scanHelp"></div>' +
       '<div class="or">or type the barcode</div>' +
       '<form class="card" id="codeForm"><div class="field"><label for="codeIn">Barcode number</label><input id="codeIn" inputmode="numeric" autocomplete="off" placeholder="For example 7891024133545"></div><button type="submit" class="btn block">Look up barcode</button></form>' +
@@ -513,8 +744,17 @@
       '<a class="btn xl block" href="#/add">➕  Add a product</a>' +
       '<p class="small muted" style="margin-top:8px">Save a barcode and ingredient list on this phone. The next time you scan it, the app will find <b>your</b> copy. Nothing is sent off this device. <a href="#/mine">See my products</a>.</p>' +
       '<div class="or">or use the ingredient list</div><a class="btn ghost block" href="#/check">📝 Paste or photograph the ingredient list</a>' +
-      recentStrip() + disclaimer();
+      recentStrip() + disclaimer() +
+      '<p class="small muted ver-line">App version ' + esc(VERSION.replace("bodycare-", "")) + ' · <span id="libInfo">US library loading…</span></p>';
     $("#startScan").addEventListener("click", beginScan);
+    loadLib().then(function (L) { var e = $("#libInfo"); if (e) e.textContent = "US library: " + L.d.rows.length.toLocaleString() + " products"; }, function (er) { var e = $("#libInfo"); if (e) e.textContent = "US library could not load (" + (er && er.message) + "). Check your connection."; });
+    $("#homePhoto").addEventListener("change", async function () {
+      var f = this.files && this.files[0], m = $("#homePhotoMsg"); this.value = ""; if (!f) return;
+      m.innerHTML = '<span class="spin"></span>Reading the barcode in your photo…';
+      try { var d = digits(await decodePhoto(f)); if (d && checkOK(d)) { m.textContent = "Read " + d + " ✔"; goProduct(d); } else m.innerHTML = "<b>No barcode could be read in that photo.</b> Take it closer so the barcode fills most of the picture, sharp and flat, or type the number below."; }
+      catch (e) { m.textContent = (e && e.message) || "That photo could not be read."; }
+    });
+    wireRescue("sr", goProduct);
     $("#stopScan").addEventListener("click", function () { stopScan(); $("#scanArea").hidden = true; });
     $("#codeForm").addEventListener("submit", function (e) { e.preventDefault(); var d = digits($("#codeIn").value); if (d.length < 6) return toast("Enter at least 6 digits."); location.hash = "#/product/" + d; });
     $("#nameForm").addEventListener("submit", function (e) { e.preventDefault(); runSearch($("#nameIn").value.trim()); });
@@ -545,51 +785,10 @@
       }).join("");
     } catch (e) { out.innerHTML = '<div class="note">Search is not available right now (' + esc(e.message) + "). Check your connection or type the barcode.</div>"; }
   }
-  async function beginScan() {
-    var area = $("#scanArea"), help = $("#scanHelp"); help.innerHTML = ""; area.hidden = false; await stopScan();
-    var video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"), zoom = $("#zoomBtn"), msg = $("#scanMsg"), read = $("#scanRead");
-    torch.hidden = true; zoom.hidden = true; read.textContent = ""; msg.textContent = "Starting the camera…";
-    var done = false, timers = [], mine = ++scanSession;
-    function clear() { timers.forEach(clearTimeout); timers = []; }
-    function onCode(raw) {
-      if (done || mine !== scanSession) return;
-      var d = digits(raw); if (!d || d.length < 6) return;
-      if (!checkOK(d)) { read.textContent = "Read " + d + " but it does not look right. Hold steady and try again."; return; }
-      done = true; clear(); read.textContent = "Scanned " + d + " ✔"; beep(); stopScan(); setTimeout(function () { location.hash = "#/product/" + d; }, 350);
-    }
-    function wireExtras() {
-      try {
-        var stream = (scanCtl && scanCtl.stream) || video.srcObject || (zx.querySelector("video") || {}).srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
-        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
-        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) { zoom.hidden = false; var z2 = false; zoom.onclick = function () { z2 = !z2; var v = z2 ? Math.min(caps.zoom.max, Math.max(caps.zoom.min * 2, 2)) : caps.zoom.min; track.applyConstraints({ advanced: [{ zoom: v }] }).catch(function () {}); zoom.textContent = z2 ? "Zoom out" : "Zoom"; }; }
-      } catch (e) {}
-    }
-    function hints() {
-      timers.push(setTimeout(function () { if (!done) msg.textContent = "Hold 6 to 8 inches away, keep the barcode flat and well lit. Tap Light if it is dark."; }, 7000));
-      timers.push(setTimeout(function () { if (!done) msg.innerHTML = "Still nothing? You can type the number printed under the barcode, below."; }, 16000));
-    }
-    async function useZxing() {
-      video.hidden = true; vf.hidden = true; zx.hidden = false; msg.textContent = "Point the camera at the barcode";
-      scanCtl = await startZxing("qr-reader", onCode); wireExtras();
-    }
-    try {
-      if (!window.isSecureContext) throw new Error("Camera needs HTTPS.");
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw new Error("This browser cannot open the camera.");
-      var native = false;
-      if (typeof window.BarcodeDetector === "function") {
-        try { video.hidden = false; zx.hidden = true; vf.hidden = false; scanCtl = await startNative(video, onCode); native = true; } catch (e) { if (e && /NotAllowed|Permission|denied|NotFound|Requested device/i.test(e.name + " " + e.message)) throw e; }
-      }
-      if (native) {
-        msg.textContent = "Point the camera at the barcode"; wireExtras();
-        /* If the built-in detector reads nothing for 4 seconds, switch to the second scanner (ZXing). */
-        timers.push(setTimeout(async function () {
-          if (done || mine !== scanSession) return;
-          msg.textContent = "Trying a second scanner…"; try { await scanCtl.stop(); } catch (e) {} scanCtl = null;
-          try { await useZxing(); } catch (e) { area.hidden = true; help.innerHTML = cameraHelp(e); }
-        }, 4000));
-      } else { await useZxing(); }
-      hints();
-    } catch (err) { clear(); area.hidden = true; help.innerHTML = cameraHelp(err); }
+  function goProduct(d) { setTimeout(function () { location.hash = "#/product/" + d; }, 300); }
+  function beginScan() {
+    runScanner({ area: $("#scanArea"), help: $("#scanHelp"), onAccept: goProduct,
+      onFail: function (err) { $("#scanHelp").innerHTML = cameraHelp(err) + rescueHTML("cf", ""); wireRescue("cf", goProduct); var t = $("#cfType"); if (t) t.focus(); } });
   }
 
   /* ---------- product ---------- */
@@ -605,7 +804,7 @@
     } else {
       p = cacheGet(code);
       if (!p) {
-        main.innerHTML = '<div class="card"><span class="spin"></span>Looking up ' + esc(code) + " in Open Beauty Facts, Open Products Facts and Open Food Facts…</div>";
+        main.innerHTML = '<div class="card scanned-card"><p class="scanned">Scanned: <b>' + esc(code) + '</b></p><p><span class="spin"></span>Checking your products, the built-in US library, then Open Beauty Facts, Open Products Facts and Open Food Facts…</p></div>';
         try { p = await lookup(code); } catch (e) {
           var c2 = cacheGet(code);
           if (!c2) { if (tok === routeToken) main.innerHTML = '<div class="note"><b>Could not reach the product databases.</b><br>' + esc(e.message) + '. Check your connection and try again, or <a href="#/check">paste the ingredient list</a>.</div>'; return; }
@@ -640,7 +839,13 @@
     } catch (e) { if (tok === routeToken) box.innerHTML = '<div class="info">The name search is not available right now (' + esc(e.message) + ").</div>"; }
   }
   function notFound(code) {
-    main.innerHTML = '<h1>Not in the free databases yet</h1><div class="card">' + addThisBtn({ code: code }) + '</div>' +
+    var ICON = { found: "✔ found", no: "not there", noing: "known, but no ingredient list", err: "did not answer" };
+    var checked = lookupLog.length ? '<ul class="checked-list">' + lookupLog.map(function (x) { return "<li><b>" + esc(x.n) + ":</b> " + esc(ICON[x.s] || x.s) + (x.s === "err" && x.e ? " (" + esc(x.e) + ")" : "") + "</li>"; }).join("") + "</ul>" : "";
+    main.innerHTML = '<h1>Not in the free databases yet</h1>' +
+      '<div class="card scanned-card"><p class="scanned">Scanned: <b>' + esc(code) + '</b></p><p class="small"><b>Is this the number printed under the barcode?</b> If not, the camera misread it: <a href="#/scan">scan again</a> or fix the number here.</p>' +
+      '<div class="rescue-row"><input id="nfFix" class="big-code" inputmode="numeric" autocomplete="off" value="' + esc(code) + '"><button type="button" class="btn" id="nfFixGo">Look up</button></div>' +
+      '<p class="small" style="margin-top:10px"><b>Places checked:</b></p>' + checked + '</div>' +
+      '<div class="card">' + addThisBtn({ code: code }) + '</div>' +
       '<div class="card"><p>The barcode <b>' + esc(code) + "</b> was read, but it is not in the built-in US library (" + (LIB ? LIB.d.rows.length.toLocaleString() : "2,000+") + " products), Open Beauty Facts, Open Products Facts or Open Food Facts (both the 12-digit UPC and 13-digit forms were tried)." + (lookupIssues.length ? " <b>" + esc(lookupIssues.join(" and ")) + " did not answer, so <a href=\"#\" id=\"retryLook\">try again</a> in a moment.</b>" : "") + " These databases are built by volunteers and many US products are still missing. The app never guesses, so nothing is shown for it.</p>" +
       "<p><b>Other ways to still get a rating:</b></p></div>" +
       '<div class="card"><h3>1. Search by name</h3><form id="nfForm"><div class="field"><label for="nfName">What is the product called? (brand and name)</label><input id="nfName" autocomplete="off" placeholder="For example Crest Cavity Protection"></div>'+ usToggle("usOnlyNf") + '<button type="submit" class="btn block">Find by name</button></form><div id="nfOut" class="search-res" style="margin-top:10px"></div>' +
@@ -649,6 +854,7 @@
       pasteForm("nf", code, "") + '<div id="pasteOut"></div>' +
       '<div class="card"><h3>3. Help everyone</h3><p class="small">Add the product to the free database: <a href="https://world.openbeautyfacts.org/cgi/product.pl?type=search_or_add&code=' + encodeURIComponent(code) + '" target="_blank" rel="noopener">Open Beauty Facts</a>.</p></div>' + disclaimer();
     stashDraft({ code: code });
+    (function () { var fi = $("#nfFix"), fg = $("#nfFixGo"); function go() { var d = digits(fi.value); if (d.length < 6) return toast("Type at least 6 digits."); if (d === code) renderProduct(code); else location.hash = "#/product/" + d; } fg.addEventListener("click", go); fi.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); go(); } }); })();
     var at0 = $("#addThis"); if (at0) at0.addEventListener("click", function () { stashDraft({ code: code }); });
     wirePaste("nf", { code: code, name: "Barcode " + code, brands: "", img: "", cat: "" });
     wireUs("usOnlyNf", function () { if ($("#nfName").value.trim().length >= 2) $("#nfForm").requestSubmit(); });
@@ -682,7 +888,9 @@
     var fav = isFav(p.code);
     var srcLine = p.mine ? '<div class="srcline">Added by you' + (p.updated ? " on " + esc(fmtWhen(p.updated)) : "") + '. Saved only on this device. <a href="#/edit/' + encodeURIComponent(p.code) + '">Edit</a>.</div>'
       : p.lib ? '<div class="srcline">Ingredients from <a href="' + esc(p.srcUrl) + '" target="_blank" rel="noopener">' + esc(p.srcName) + "</a>, checked " + esc(fmtDate(p.lib.checked)) + (p.lib.updated ? " (source updated " + esc(fmtDate(p.lib.updated)) + ")" : "") + "." + (p.lib.active ? "<br>Active ingredient (drug facts): " + esc(p.lib.active.replace(/^\s*active ingredients?\s*(\([^)]*\))?\s*[:\-]?\s*/i, "").replace(/\s*purposes?\b.*$/i, "")) : "") + "</div>" : "";
-    var head = '<div class="card"><div class="prodhead">' + (p.img ? '<img src="' + esc(p.img) + '" alt="">' : '<div class="ph" style="width:84px;height:84px;display:flex;align-items:center;justify-content:center;font-size:2.4rem" aria-hidden="true">🧴</div>') +
+    var where = p.mine ? "your products on this device" : p.lib ? "the built-in US library" : p.pasted ? "" : (p.srcName || "Open Beauty Facts");
+    var scannedLine = /^\d{6,14}$/.test(p.code) ? '<p class="scanned small">Barcode <b>' + esc(p.code) + "</b>" + (where ? " · found in " + esc(where) : "") + "</p>" : "";
+    var head = '<div class="card">' + scannedLine + '<div class="prodhead">' + (p.img ? '<img src="' + esc(p.img) + '" alt="">' : '<div class="ph" style="width:84px;height:84px;display:flex;align-items:center;justify-content:center;font-size:2.4rem" aria-hidden="true">🧴</div>') +
       '<div><h1>' + esc(p.name) + '</h1><div class="muted">' + esc(p.brands || "Unknown brand") + (p.qty ? " · " + esc(p.qty) : "") + '</div><div class="row" style="margin-top:6px">' +
       (cat ? '<span class="chip help">' + cat.icon + " " + esc(cat.label) + "</span>" : '<span class="chip na">Type unknown</span>') + (p.mine ? '<span class="chip low">Added by you</span>' : "") + (p.lib ? '<span class="chip low">🇺🇸 US maker label</span>' : "") + (p.pasted ? '<span class="chip na">Your list</span>' : "") + (override ? '<span class="chip na">Your edited list</span>' : "") + "</div></div></div>" +
       '<div class="row" style="margin-top:10px"><button class="btn small ' + (fav ? "" : "ghost") + '" id="favBtn">' + (fav ? "★ Saved" : "☆ Save to favorites") + '</button>' +
@@ -932,7 +1140,7 @@
       '<div class="row"><button type="button" class="btn ghost" id="addScanBtn">📷 Scan barcode</button></div>' +
       '<div id="addScanArea" hidden><div class="scan-stage"><video id="scanVideo" playsinline muted autoplay></video><div id="qr-reader" hidden></div>' +
       '<div class="viewfinder" id="vf"><div class="vf-box"></div></div><div class="scan-msg" id="scanMsg">Point the camera at the barcode</div><div class="scan-read" id="scanRead" aria-live="polite"></div>' +
-      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div></div>' +
+      '<div class="scan-actions"><button type="button" class="btn ghost small" id="torchBtn" hidden style="background:#fff">Light</button><button type="button" class="btn ghost small" id="zoomBtn" hidden style="background:#fff">Zoom</button><button type="button" class="btn small" id="stopScan">Cancel</button></div></div><div id="scanRescue" hidden>' + rescueHTML("sr", "") + '</div></div>' +
       '<div class="field"><label for="addName">Product name</label><input id="addName" autocomplete="off" required value="' + esc(val.name) + '" placeholder="For example Cool Mint Antiseptic"></div>' +
       '<div class="field"><label for="addBrand">Brand</label><input id="addBrand" autocomplete="off" value="' + esc(val.brands) + '" placeholder="For example Listerine"></div>' +
       '<div class="small muted">Product type (helps the rating, for example alcohol in a mouthwash):</div>' + catChips(val.cat, "addChips") +
@@ -967,6 +1175,7 @@
     $("#addPhotoClr").addEventListener("click", function () { photo = ""; $("#addPhotoPrev").innerHTML = ""; this.hidden = true; $("#addPhoto").value = ""; });
     $("#addOcr").addEventListener("change", function () { if (this.files && this.files[0]) runOCR(this.files[0], $("#addIng"), $("#addOcrMsg")).then(drawPrev); });
     $("#addScanBtn").addEventListener("click", function () { $("#addScanArea").hidden = false; beginScanToField($("#addCode")); });
+    wireRescue("sr", function (d) { var ac = $("#addCode"); ac.value = d; try { ac.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {} stopScan(); $("#addScanArea").hidden = true; });
     $("#addSave").addEventListener("click", async function () {
       var c = digits($("#addCode").value) || (existing ? existing.code : "");
       var name = $("#addName").value.trim(), brands = $("#addBrand").value.trim(), qty = $("#addQty").value.trim(), ing = $("#addIng").value.trim();
@@ -991,43 +1200,10 @@
       await mineDel(existing.code); toast("Removed from this device"); location.hash = "#/mine";
     });
   }
-  async function beginScanToField(input) {
-    var area = $("#addScanArea"), video = $("#scanVideo"), zx = $("#qr-reader"), vf = $("#vf"), torch = $("#torchBtn"), zoom = $("#zoomBtn"), msg = $("#scanMsg"), read = $("#scanRead");
-    if (!area) return;
-    area.hidden = false; await stopScan();
-    torch.hidden = true; zoom.hidden = true; read.textContent = ""; msg.textContent = "Starting the camera…";
-    var done = false, timers = [], sess = ++scanSession;
-    function clear() { timers.forEach(clearTimeout); timers = []; }
-    function onCode(raw) {
-      if (done || sess !== scanSession) return;
-      var d = digits(raw); if (!d || d.length < 6) return;
-      if (!checkOK(d)) { read.textContent = "Read " + d + " but it does not look right. Hold steady and try again."; return; }
-      done = true; clear(); input.value = d; read.textContent = "Scanned " + d + " ✔"; beep(); stopScan();
-      setTimeout(function () { area.hidden = true; }, 400);
-    }
-    function wireExtras() {
-      try {
-        var stream = (scanCtl && scanCtl.stream) || video.srcObject || (zx.querySelector("video") || {}).srcObject, track = stream && stream.getVideoTracks()[0], caps = track && track.getCapabilities && track.getCapabilities();
-        if (caps && caps.torch) { torch.hidden = false; var on = false; torch.onclick = function () { on = !on; track.applyConstraints({ advanced: [{ torch: on }] }).catch(function () {}); torch.textContent = on ? "Light off" : "Light"; }; }
-        if (caps && caps.zoom && caps.zoom.max > caps.zoom.min) { zoom.hidden = false; var z2 = false; zoom.onclick = function () { z2 = !z2; var v = z2 ? Math.min(caps.zoom.max, Math.max(caps.zoom.min * 2, 2)) : caps.zoom.min; track.applyConstraints({ advanced: [{ zoom: v }] }).catch(function () {}); zoom.textContent = z2 ? "Zoom out" : "Zoom"; }; }
-      } catch (e) {}
-    }
-    async function useZxing() { video.hidden = true; vf.hidden = true; zx.hidden = false; msg.textContent = "Point the camera at the barcode"; scanCtl = await startZxing("qr-reader", onCode); wireExtras(); }
-    try {
-      if (!window.isSecureContext) throw new Error("Camera needs HTTPS.");
-      var native = false;
-      if (typeof window.BarcodeDetector === "function") {
-        try { video.hidden = false; zx.hidden = true; vf.hidden = false; scanCtl = await startNative(video, onCode); native = true; } catch (e) { if (e && /NotAllowed|Permission|denied|NotFound|Requested device/i.test(e.name + " " + e.message)) throw e; }
-      }
-      if (native) {
-        msg.textContent = "Point the camera at the barcode"; wireExtras();
-        timers.push(setTimeout(async function () {
-          if (done || sess !== scanSession) return;
-          msg.textContent = "Trying a second scanner…"; try { await scanCtl.stop(); } catch (e) {} scanCtl = null;
-          try { await useZxing(); } catch (e) { area.hidden = true; toast((e && e.message) || "The camera could not start."); }
-        }, 4000));
-      } else { await useZxing(); }
-    } catch (err) { area.hidden = true; toast((err && err.message) || "The camera could not start."); }
+  function beginScanToField(input) {
+    var area = $("#addScanArea"); if (!area) return;
+    function put(d) { input.value = d; try { input.dispatchEvent(new Event("input", { bubbles: true })); } catch (e) {} setTimeout(function () { area.hidden = true; }, 400); }
+    runScanner({ area: area, help: null, onAccept: put, onFail: function (err) { toast(((err && err.message) || "The camera could not start") + ". Type the number or use Take a photo."); } });
     var st = $("#stopScan"); if (st) st.onclick = function () { stopScan(); area.hidden = true; };
   }
   async function renderMine() {
